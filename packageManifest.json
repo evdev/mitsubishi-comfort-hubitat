@@ -1,7 +1,7 @@
 {
   "packageName": "Mitsubishi Comfort Cloud",
   "author": "evdev",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "minimumHEVersion": "2.3.0",
   "dateReleased": "2026-07-26",
   "category": "Integrations",
@@ -10,7 +10,7 @@
   "documentationLink": "https://github.com/evdev/mitsubishi-comfort-hubitat#readme",
   "communityLink": "https://github.com/evdev/mitsubishi-comfort-hubitat/issues",
   "gitHubUrl": "https://github.com/evdev/mitsubishi-comfort-hubitat",
-  "releaseNotes": "Initial release: cloud thermostat control, indoor/wireless sensors, WiFi diagnostics, and filter reminder metadata.",
+  "releaseNotes": "2026-07-26: 1.0.1 - Profile-driven fan modes (numberOfFanSpeeds, hasFanSpeedAuto); min/max setpoint attributes per mode on thermostat child; fan command validation against supported speeds.\n2026-07-26: 1.0.0 - Initial release: cloud thermostat control, indoor/wireless sensors, WiFi diagnostics, and filter reminder metadata.",
   "apps": [
     {
       "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",

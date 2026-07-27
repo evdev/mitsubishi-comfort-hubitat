@@ -16,6 +16,14 @@ metadata {
         attribute "cloudStatus", "STRING"
         attribute "comfortFanSpeed", "STRING"
         attribute "comfortMode", "STRING"
+        attribute "minHeatingSetpoint", "NUMBER"
+        attribute "maxHeatingSetpoint", "NUMBER"
+        attribute "minCoolingSetpoint", "NUMBER"
+        attribute "maxCoolingSetpoint", "NUMBER"
+        attribute "minAutoSetpoint", "NUMBER"
+        attribute "maxAutoSetpoint", "NUMBER"
+        attribute "minDrySetpoint", "NUMBER"
+        attribute "maxDrySetpoint", "NUMBER"
 
         command "setVanePosition", [[name: "position*", type: "ENUM", constraints: [
             "auto", "swing", "lowest", "low", "middle", "high", "highest"
@@ -181,6 +189,16 @@ def applyThermostatState(Map st) {
     }
     if (st.serialNumber != null) {
         updateDataValue("serialNumber", st.serialNumber.toString())
+    }
+    [
+        "minHeatingSetpoint", "maxHeatingSetpoint",
+        "minCoolingSetpoint", "maxCoolingSetpoint",
+        "minAutoSetpoint", "maxAutoSetpoint",
+        "minDrySetpoint", "maxDrySetpoint"
+    ].each { attr ->
+        if (st[attr] != null) {
+            sendEvent(name: attr, value: st[attr], unit: unit)
+        }
     }
 }
 

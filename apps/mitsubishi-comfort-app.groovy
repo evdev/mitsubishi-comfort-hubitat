@@ -72,6 +72,15 @@ definition(
     "off": "off", "cool": "cool", "heat": "heat", "dry": "dry", "fan": "vent", "auto": "auto"
 ]
 
+@Field static final List UI_FAN_ORDER = ["auto", "quiet", "low", "medium", "high", "powerful"]
+
+@Field static final Map FAN_SPEEDS_BY_COUNT = [
+    2: ["low", "high"],
+    3: ["low", "medium", "high"],
+    4: ["quiet", "low", "medium", "high"],
+    5: ["quiet", "low", "medium", "high", "powerful"]
+]
+
 preferences {
     page(name: "mainPage")
     page(name: "cleanupPage")
@@ -837,7 +846,8 @@ def pushThermostatState(String serial) {
         "offline"
 
     def supportedModes = buildSupportedModes(profile)
-    def supportedFans = JsonOutput.toJson(["auto", "quiet", "low", "medium", "high", "powerful"])
+    def supportedFans = JsonOutput.toJson(buildSupportedFanModes(profile))
+    def setpointLimits = buildSetpointLimits(profile)
 
     def singleSp = null
     if (hubMode == "heat") singleSp = heatSp
@@ -845,7 +855,7 @@ def pushThermostatState(String serial) {
     else if (hubMode == "auto") singleSp = coolSp ?: heatSp
 
     try {
-        child.applyThermostatState([
+        def stateMap = [
             supportedModes: JsonOutput.toJson(supportedModes),
             supportedFanModes: supportedFans,
             tempUnit: tempUnit,
@@ -860,7 +870,9 @@ def pushThermostatState(String serial) {
             cloudStatus: cloudStatus,
             model: device.model?.materialDescription,
             serialNumber: device.serialNumber
-        ])
+        ]
+        stateMap.putAll(setpointLimits)
+        child.applyThermostatState(stateMap)
     } catch (Exception e) {
         log.error "pushThermostatState failed for ${tailSerial(serial)}: ${e.message}"
     }
@@ -946,21 +958,66 @@ def pushFilterState(String serial) {
     }
 }
 
+def normalizeProfile(profile) {
+    if (!profile) return null
+    if (profile instanceof List) {
+        if (profile.isEmpty()) return null
+        profile = profile[0]
+    }
+    return (profile instanceof Map) ? profile : null
+}
+
 def buildSupportedModes(profile) {
     def modes = ["off"]
-    if (!profile) return modes + ["heat", "cool", "auto"]
-    def p = profile
-    if (p instanceof List) {
-        if (p.isEmpty()) return modes + ["heat", "cool", "auto"]
-        p = p[0]
-    }
-    if (!(p instanceof Map)) return modes + ["heat", "cool", "auto"]
+    def p = normalizeProfile(profile)
+    if (!p) return modes + ["heat", "cool", "auto"]
     if (p.hasModeHeat || p.maximumSetPoints?.heat != null) modes << "heat"
     if (p.hasModeCool || p.maximumSetPoints?.cool != null) modes << "cool"
     if (p.hasModeDry) modes << "dry"
     if (p.hasModeFan || p.hasModeVent) modes << "fan"
     if (p.hasModeAuto || p.maximumSetPoints?.auto != null) modes << "auto"
     return modes
+}
+
+def buildSupportedFanModes(profile) {
+    def p = normalizeProfile(profile)
+    if (!p) return UI_FAN_ORDER
+
+    def count = (p.numberOfFanSpeeds ?: 0) as int
+    def hasAuto = p.hasFanSpeedAuto ? true : false
+
+    if (count <= 0) {
+        return hasAuto ? ["auto"] : []
+    }
+
+    def manual = FAN_SPEEDS_BY_COUNT[count] ?: FAN_SPEEDS_BY_COUNT[5]
+    def fans = []
+    if (hasAuto) fans << "auto"
+    fans.addAll(manual)
+    return fans
+}
+
+def buildSetpointLimits(profile) {
+    def p = normalizeProfile(profile)
+    if (!p) return [:]
+
+    def minSp = (p.minimumSetPoints instanceof Map) ? p.minimumSetPoints : [:]
+    def maxSp = (p.maximumSetPoints instanceof Map) ? p.maximumSetPoints : [:]
+    def limits = [:]
+
+    if (minSp.heat != null) limits.minHeatingSetpoint = cToDisplay(minSp.heat)
+    if (maxSp.heat != null) limits.maxHeatingSetpoint = cToDisplay(maxSp.heat)
+    if (minSp.cool != null) limits.minCoolingSetpoint = cToDisplay(minSp.cool)
+    if (maxSp.cool != null) limits.maxCoolingSetpoint = cToDisplay(maxSp.cool)
+    if (minSp.auto != null) limits.minAutoSetpoint = cToDisplay(minSp.auto)
+    if (maxSp.auto != null) limits.maxAutoSetpoint = cToDisplay(maxSp.auto)
+    if (p.hasModeDry) {
+        if (minSp.dry != null) limits.minDrySetpoint = cToDisplay(minSp.dry)
+        else if (minSp.cool != null) limits.minDrySetpoint = cToDisplay(minSp.cool)
+        if (maxSp.dry != null) limits.maxDrySetpoint = cToDisplay(maxSp.dry)
+        else if (maxSp.cool != null) limits.maxDrySetpoint = cToDisplay(maxSp.cool)
+    }
+    return limits
 }
 
 def mapKumoMode(device) {
@@ -990,10 +1047,7 @@ def computeOperatingState(String hubMode, room, heatSp, coolSp, device) {
 }
 
 def firstProfile(String serial) {
-    def p = state.profiles[serial]
-    if (!p) return null
-    if (p instanceof List) return p.isEmpty() ? null : p[0]
-    return p
+    return normalizeProfile(state.profiles[serial])
 }
 
 // --- Temperature conversion ---
@@ -1196,7 +1250,13 @@ def componentSetCoolingSetpoint(child, temperature) {
 def componentSetFanSpeed(child, String fan) {
     def serial = child?.getDataValue("deviceSerial")
     if (!serial || !fan) return
-    def apiFan = UI_TO_API_FAN[fan.toLowerCase()] ?: fan
+    def normalized = fan.toLowerCase()
+    def supported = buildSupportedFanModes(firstProfile(serial))
+    if (!supported.contains(normalized)) {
+        log.warn "Fan mode '${fan}' not supported for ${tailSerial(serial)}; supported: ${supported}"
+        return
+    }
+    def apiFan = UI_TO_API_FAN[normalized] ?: normalized
     enqueueCommands(serial, [fanSpeed: apiFan])
 }
 
