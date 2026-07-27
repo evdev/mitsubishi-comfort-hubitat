@@ -1670,10 +1670,16 @@ def sha256Bytes(byte[] data) {
     return md.digest(data)
 }
 
+def copyBytes(byte[] src, int srcOff, byte[] dest, int destOff, int len) {
+    for (int i = 0; i < len; i++) {
+        dest[destOff + i] = src[srcOff + i]
+    }
+}
+
 def concatBytes(byte[] a, byte[] b) {
     byte[] out = new byte[a.length + b.length]
-    System.arraycopy(a, 0, out, 0, a.length)
-    System.arraycopy(b, 0, out, a.length, b.length)
+    copyBytes(a, 0, out, 0, a.length)
+    copyBytes(b, 0, out, a.length, b.length)
     return out
 }
 
@@ -1687,14 +1693,14 @@ def computeKumoToken(String passwordB64, String cryptoSerialHex, String bodyStr)
         if (cryptoSerial.length < CRYPTO_SERIAL_MIN_BYTES) return null
 
         byte[] intermediate = new byte[88]
-        System.arraycopy(wParam, 0, intermediate, 0, 32)
-        System.arraycopy(dataHash, 0, intermediate, 32, 32)
+        copyBytes(wParam, 0, intermediate, 0, 32)
+        copyBytes(dataHash, 0, intermediate, 32, 32)
         intermediate[64] = (byte) 0x08
         intermediate[65] = (byte) 0x40
         intermediate[66] = (byte) 0x00
         intermediate[79] = cryptoSerial[8]
-        System.arraycopy(cryptoSerial, 4, intermediate, 80, 4)
-        System.arraycopy(cryptoSerial, 0, intermediate, 84, 4)
+        copyBytes(cryptoSerial, 4, intermediate, 80, 4)
+        copyBytes(cryptoSerial, 0, intermediate, 84, 4)
         return bytesToHex(sha256Bytes(intermediate))
     } catch (Exception e) {
         log.error "computeKumoToken failed: ${e.message}"
