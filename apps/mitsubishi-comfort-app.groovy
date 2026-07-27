@@ -10,12 +10,13 @@
 import groovy.transform.Field
 import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
+import java.security.MessageDigest
 
 definition(
     name: "Mitsubishi Comfort",
     namespace: "ephrayim",
     author: "ephrayim",
-    description: "Cloud integration for Mitsubishi Comfort / Kumo Cloud HVAC zones",
+    description: "Mitsubishi Comfort / Kumo Cloud HVAC with hybrid local LAN control",
     category: "Integrations",
     iconUrl: "",
     iconX2Url: "",
@@ -23,6 +24,7 @@ definition(
 )
 
 @Field static final String API_BASE = "https://app-prod.kumocloud.com"
+@Field static final String SOCKET_BASE = "https://socket-prod.kumocloud.com"
 @Field static final String API_VERSION = "v3"
 @Field static final String API_APP_VERSION = "3.2.4"
 @Field static final Long TOKEN_TTL_MS = 20L * 60L * 1000L
@@ -30,6 +32,16 @@ definition(
 @Field static final Long COMMAND_TTL_MS = 60L * 1000L
 @Field static final Long COMMAND_GAP_MS = 5000L
 @Field static final Integer STALE_FAIL_THRESHOLD = 3
+@Field static final Integer LOCAL_FAIL_THRESHOLD = 3
+@Field static final Long LOCAL_DEGRADE_MS = 5L * 60L * 1000L
+@Field static final Long OFFLINE_PROBE_MS = 10L * 60L * 1000L
+@Field static final Integer LOCAL_HTTP_TIMEOUT = 8
+@Field static final Integer CRYPTO_SERIAL_MIN_BYTES = 9
+@Field static final String LOCAL_STATUS_QUERY = '{"c":{"indoorUnit":{"status":{}}}}'
+@Field static final String LOCAL_PROFILE_QUERY = '{"c":{"indoorUnit":{"profile":{}}}}'
+@Field static final String LOCAL_ADAPTER_STATUS_QUERY = '{"c":{"adapter":{"status":{}}}}'
+@Field static final String LOCAL_ADAPTER_INFO_QUERY = '{"c":{"adapter":{"info":{}}}}'
+@Field static final String W_PARAM_HEX = "44c73283b498d432ff25f5c8e06a016aef931e68f0a00ea710e36e6338fb22db"
 
 @Field static final Map F_TO_C = [
     61: 16.0, 62: 16.5, 63: 17.0, 64: 17.5, 65: 18.0, 66: 18.5,
@@ -95,6 +107,13 @@ def mainPage() {
     }
     state.lastCredKey = credKey
 
+    if (params?.action == "refreshCreds" && tokenIsFresh()) {
+        startSocketIoPasswordFetch()
+    }
+    if (params?.action == "rediscoverIp") {
+        startIpDiscovery()
+    }
+
     if (settings.username && settings.password && !state.setupSitesLoaded) {
         loadSetupSites()
     }
@@ -122,6 +141,34 @@ def mainPage() {
                 "300": "5 minutes",
                 "600": "10 minutes"
             ], defaultValue: "60", required: true
+        }
+        section("Local control") {
+            input name: "preferLocal", type: "bool", title: "Prefer local LAN control", defaultValue: true
+            input name: "allowOffline", type: "bool", title: "Allow offline local control when internet is down", defaultValue: true
+            input name: "enableSubnetScan", type: "bool", title: "Scan subnet for unit IPs (optional)", defaultValue: false
+            input name: "subnetOverride", type: "text", title: "Subnet to scan (e.g. 192.168.1)", required: false
+            if (state.offlineReady) {
+                paragraph "Offline ready: cached credentials and IPs allow local control without internet."
+            } else if (state.knownSerials instanceof List && !state.knownSerials.isEmpty()) {
+                paragraph "Offline not ready: enter unit IPs below and ensure cloud login has fetched local passwords."
+            }
+            if (state.cloudOffline) {
+                paragraph "Operating in offline local-only mode (cloud unreachable)."
+            }
+            if (state.lastCloudContact) {
+                paragraph "Last cloud contact: ${state.lastCloudContact}"
+            }
+            if (state.zoneIndex instanceof Map && !state.zoneIndex.isEmpty()) {
+                state.zoneIndex.each { serial, info ->
+                    def ipKey = unitIpSettingKey(serial as String)
+                    def title = "${info?.zoneName ?: serial} IP"
+                    def cur = state.localCreds?.get(serial)?.address
+                    if (cur) title = "${title} (current: ${cur})"
+                    input name: ipKey, type: "text", title: title, required: false
+                }
+            }
+            href name: "mainPage", title: "Refresh local credentials", description: "Re-fetch passwords from cloud", params: [action: "refreshCreds"]
+            href name: "mainPage", title: "Re-discover local IPs", description: "Probe subnet for units", params: [action: "rediscoverIp"]
         }
         section("Diagnostics") {
             input name: "debugLogging", type: "bool", title: "Debug logging (auto-off after 30 min)", defaultValue: false
@@ -153,6 +200,7 @@ def installed() {
 
 def updated() {
     log.info "Mitsubishi Comfort updated"
+    syncManualIpSettings()
     initializeApp(false)
 }
 
@@ -176,12 +224,21 @@ def initializeApp(Boolean fullInit) {
         return
     }
 
+    syncManualIpSettings()
+    recomputeOfflineReady()
+
     if (fullInit && state.setupAccessToken) {
         atomicState.accessToken = state.setupAccessToken
         atomicState.refreshToken = state.setupRefreshToken
         atomicState.tokenExpiresAt = now() + TOKEN_TTL_MS
         state.remove("setupAccessToken")
         state.remove("setupRefreshToken")
+    }
+
+    if (!tokenIsFresh() && offlineOperationAllowed()) {
+        state.cloudOffline = true
+        onOfflineBoot(fullInit ? "initialDiscover" : "resume")
+        return
     }
 
     runtimeLogin(fullInit ? "initialDiscover" : "resume")
@@ -207,6 +264,13 @@ def ensureStateMaps() {
     if (!(state.lastCommandFields instanceof Map)) state.lastCommandFields = [:]
     if (!(state.pendingHttpQueue instanceof List)) state.pendingHttpQueue = []
     if (!(state.knownSerials instanceof List)) state.knownSerials = []
+    if (!(state.localCreds instanceof Map)) state.localCreds = [:]
+    if (!(state.localInFlight instanceof Map)) state.localInFlight = [:]
+    if (!(state.localFailCounts instanceof Map)) state.localFailCounts = [:]
+    if (!(state.localDegradedUntil instanceof Map)) state.localDegradedUntil = [:]
+    if (!(state.lastConnectionPath instanceof Map)) state.lastConnectionPath = [:]
+    if (!(state.ipProbeQueue instanceof List)) state.ipProbeQueue = []
+    if (!(state.ipProbeActive instanceof Map)) state.ipProbeActive = [:]
 }
 
 // --- Setup-time synchronous auth ---
@@ -279,6 +343,10 @@ def loadSetupSites() {
 
 def runtimeLogin(String nextStep) {
     state.authNextStep = nextStep
+    if (state.cloudOffline && offlineOperationAllowed()) {
+        onOfflineBoot(nextStep)
+        return
+    }
     if (tokenIsFresh()) {
         onAuthSuccess()
         return
@@ -290,12 +358,30 @@ def runtimeLogin(String nextStep) {
     }
 }
 
+def onOfflineBoot(String nextStep) {
+    log.warn "Mitsubishi Comfort: cloud offline — using local-only mode"
+    if (!state.pollingScheduled) {
+        schedulePolling()
+        state.pollingScheduled = true
+    }
+    if (stepNeedsLocalPoll(nextStep)) {
+        refreshAllDeviceDetailsLocal()
+    }
+    scheduleOfflineCloudProbe()
+}
+
 def tokenIsFresh() {
     return atomicState.accessToken && atomicState.tokenExpiresAt &&
         ((atomicState.tokenExpiresAt as long) > (now() + TOKEN_MARGIN_MS))
 }
 
+def stepNeedsLocalPoll(String step) {
+    return step in ["initialDiscover", "resume"]
+}
+
 def onAuthSuccess() {
+    state.cloudOffline = false
+    state.lastCloudContact = new Date().format("yyyy-MM-dd HH:mm:ss")
     def step = state.authNextStep
     state.authNextStep = null
 
@@ -303,6 +389,7 @@ def onAuthSuccess() {
         schedulePolling()
         state.pollingScheduled = true
     }
+    scheduleOfflineCloudProbe()
 
     // Replay any requests deferred for auth, then continue with discovery/resume.
     if (state.pendingHttpQueue && !state.pendingHttpQueue.isEmpty()) {
@@ -332,6 +419,15 @@ def onAuthSuccess() {
             discoverZones()
         }
     }
+    if (!state.socketIoActive) {
+        runIn(2, "maybeStartCredentialFetch", [overwrite: true])
+    }
+}
+
+def maybeStartCredentialFetch() {
+    if (state.cloudOffline) return
+    if (!tokenIsFresh()) return
+    startSocketIoPasswordFetch()
 }
 
 def failPendingAuthRequests() {
@@ -414,12 +510,19 @@ def authCallback(response, data) {
             if (data?.action == "refresh") {
                 loginWithPassword()
             } else if (data?.action == "login") {
-                failPendingAuthRequests()
+                if (tryEnterOfflineMode("login failed")) {
+                    onOfflineBoot(state.authNextStep ?: "resume")
+                } else {
+                    failPendingAuthRequests()
+                }
             }
         }
     } catch (Exception e) {
         atomicState.refreshInProgress = false
         log.error "Auth callback error: ${e.message}"
+        if (tryEnterOfflineMode("auth error")) {
+            onOfflineBoot(state.authNextStep ?: "resume")
+        }
     }
 }
 
@@ -571,23 +674,41 @@ def schedulePolling() {
     schedule("0 0/15 * * * ?", "pollNotificationsAll")
     schedule("0 0 3 * * ?", "pollProfilesAll")
     schedule("0 0/15 * * * ?", "cullCommandCache")
+    schedule("0 0 4 * * ?", "dailyCredentialRefresh")
+}
+
+def dailyCredentialRefresh() {
+    if (state.cloudOffline || !tokenIsFresh()) return
+    startSocketIoPasswordFetch()
 }
 
 def pollDevices() {
+    if (state.cloudOffline) {
+        refreshAllDeviceDetailsLocal()
+        return
+    }
     refreshAllDeviceDetails()
 }
 
 def pollZones() {
+    if (state.cloudOffline) return
     discoverZones()
 }
 
 def pollStatusAll() {
+    if (state.cloudOffline) {
+        (state.knownSerials ?: []).each { serial ->
+            localPollAdapter(serial as String)
+        }
+        return
+    }
     (state.knownSerials ?: []).each { serial ->
         apiGet("/devices/${serial}/status", [requestType: "status", serial: serial])
     }
 }
 
 def pollNotificationsAll() {
+    if (state.cloudOffline) return
     (state.zoneIndex ?: [:]).each { serial, info ->
         if (info?.zoneId) {
             apiGet("/zones/${info.zoneId}/notification-preferences", [
@@ -598,6 +719,12 @@ def pollNotificationsAll() {
 }
 
 def pollProfilesAll() {
+    if (state.cloudOffline) {
+        (state.knownSerials ?: []).each { serial ->
+            localPollProfile(serial as String)
+        }
+        return
+    }
     (state.knownSerials ?: []).each { serial ->
         apiGet("/devices/${serial}/profile", [requestType: "profile", serial: serial])
     }
@@ -634,12 +761,34 @@ def refreshAllDeviceDetails() {
     }
 }
 
+def refreshAllDeviceDetailsLocal() {
+    (state.knownSerials ?: []).eachWithIndex { serial, idx ->
+        runIn(idx as Long, "refreshDeviceDetailLocalDelayed", [data: [serial: serial], overwrite: false])
+    }
+}
+
+def refreshDeviceDetailLocalDelayed(data) {
+    def serial = data?.serial as String
+    if (serial) refreshDeviceDetailLocal(serial)
+}
+
 def refreshDeviceDetail(String serial) {
     if (!serial) return
+    if (canUseLocal(serial)) {
+        refreshDeviceDetailLocal(serial)
+        return
+    }
     apiGet("/devices/${serial}", [requestType: "device", serial: serial])
     if (state.zoneIndex[serial]?.hasSensor) {
         apiGet("/devices/${serial}/sensor", [requestType: "wireless", serial: serial])
     }
+}
+
+def refreshDeviceDetailLocal(String serial) {
+    if (!serial || !canUseLocal(serial)) return
+    // Status only; profile/adapter/sensors are chained after the response
+    // so the adapter never sees overlapping connections.
+    localPollStatus(serial)
 }
 
 def handleZonesResponse(int status, parsed) {
@@ -670,6 +819,14 @@ def handleZonesResponse(int status, parsed) {
 
     state.knownSerials = activeSerials as List
     markMissingSerialsStale(activeSerials)
+    syncManualIpSettings()
+    recomputeOfflineReady()
+    if (!state.cloudOffline && tokenIsFresh()) {
+        runIn(3, "maybeStartCredentialFetch", [overwrite: true])
+    }
+    if (settings.enableSubnetScan) {
+        runIn(5, "startIpDiscovery", [overwrite: true])
+    }
 }
 
 def ensureZoneChildren(String serial, String zoneId, String zoneName, Boolean hasSensor) {
@@ -760,6 +917,7 @@ def handleProfileResponse(int status, parsed, String serial) {
 def handleStatusResponse(int status, parsed, String serial) {
     if (status == 200 && parsed instanceof Map && serial) {
         state.statusData[serial] = parsed
+        mergeStatusIntoLocalCreds(serial, parsed)
         pushDiagnosticState(serial)
     }
 }
@@ -854,6 +1012,8 @@ def pushThermostatState(String serial) {
     else if (hubMode == "cool") singleSp = coolSp
     else if (hubMode == "auto") singleSp = coolSp ?: heatSp
 
+    def connPath = state.lastConnectionPath[serial] ?: (state.cloudOffline ? "offline" : "cloud")
+
     try {
         def stateMap = [
             supportedModes: JsonOutput.toJson(supportedModes),
@@ -868,6 +1028,7 @@ def pushThermostatState(String serial) {
             thermostatOperatingState: computeOperatingState(hubMode, room, heatSp, coolSp, device),
             vanePosition: vane,
             cloudStatus: cloudStatus,
+            connectionPath: connPath,
             model: device.model?.materialDescription,
             serialNumber: device.serialNumber
         ]
@@ -1145,13 +1306,28 @@ def processCommandQueue(data) {
     def serial = data?.serial as String
     if (!serial) return
 
-    if (state.commandInFlight[serial]) {
+    if (state.commandInFlight[serial] || state.localInFlight[serial]) {
         runIn(2, "processCommandQueue", [data: [serial: serial], overwrite: false])
         return
     }
 
     def pending = state.commandPending[serial]
     if (!(pending instanceof Map) || pending.isEmpty()) return
+
+    if (canUseLocal(serial)) {
+        def toSend = [:]
+        toSend.putAll(pending)
+        state.commandPending[serial] = [:]
+        state.lastCommandFields[serial] = toSend.keySet() as List
+        state.commandInFlight[serial] = true
+        sendLocalCommands(serial, toSend)
+        return
+    }
+
+    if (state.cloudOffline) {
+        log.warn "Cannot send command for ${tailSerial(serial)}: offline and local credentials incomplete"
+        return
+    }
 
     def last = (state.lastCommandSend[serial] ?: 0L) as long
     def elapsed = now() - last
@@ -1172,7 +1348,6 @@ def processCommandQueue(data) {
         requestType: "command", serial: serial, postBody: body
     ])
     if (sent == false) {
-        // Auth deferral queued the request; keep inFlight false until replay starts.
         state.commandInFlight[serial] = false
     }
 }
@@ -1196,10 +1371,15 @@ def buildCommandBase(String serial) {
 def componentRefresh(child) {
     def serial = child?.getDataValue("deviceSerial")
     if (!serial) return
-    refreshDeviceDetail(serial)
-    apiGet("/devices/${serial}/status", [requestType: "status", serial: serial])
+    if (state.cloudOffline || canUseLocal(serial)) {
+        refreshDeviceDetailLocal(serial)
+        localPollAdapter(serial)
+    } else {
+        refreshDeviceDetail(serial)
+        apiGet("/devices/${serial}/status", [requestType: "status", serial: serial])
+    }
     def zoneId = child.getDataValue("zoneId")
-    if (zoneId) {
+    if (zoneId && !state.cloudOffline) {
         apiGet("/zones/${zoneId}/notification-preferences", [
             requestType: "notifications", zoneId: zoneId, serial: serial
         ])
@@ -1323,6 +1503,692 @@ def tailSerial(String serial) {
     if (!serial) return "?"
     if (serial.length() <= 6) return serial
     return serial.substring(serial.length() - 6)
+}
+
+// --- Local API: credentials, auth, HTTP, offline ---
+
+def unitIpSettingKey(String serial) {
+    return "unitIp_" + (serial ?: "").replaceAll("[^a-zA-Z0-9]", "_")
+}
+
+def syncManualIpSettings() {
+    if (!(state.zoneIndex instanceof Map)) return
+    state.zoneIndex.each { serial, info ->
+        def s = serial as String
+        def key = unitIpSettingKey(s)
+        def ip = settings[key]?.toString()?.trim()
+        if (!ip) return
+        ensureLocalCredEntry(s)
+        state.localCreds[s].address = ip
+        state.localCreds[s].addressLocked = true
+    }
+    recomputeOfflineReady()
+}
+
+def ensureLocalCredEntry(String serial) {
+    if (!(state.localCreds[serial] instanceof Map)) {
+        state.localCreds[serial] = [:]
+    }
+}
+
+def mergeStatusIntoLocalCreds(String serial, Map status) {
+    if (!serial || !(status instanceof Map)) return
+    ensureLocalCredEntry(serial)
+    def creds = state.localCreds[serial] as Map
+    if (status.cryptoSerial) creds.cryptoSerial = status.cryptoSerial as String
+    if (status.mac) creds.mac = status.mac as String
+    recomputeOfflineReady()
+}
+
+def recomputeOfflineReady() {
+    def serials = state.knownSerials ?: []
+    if (!serials) {
+        state.offlineReady = false
+        return
+    }
+    def ready = true
+    serials.each { serial ->
+        def s = serial as String
+        def creds = state.localCreds[s]
+        if (!(creds instanceof Map) || !creds.password || !creds.cryptoSerial || !creds.address) {
+            ready = false
+        }
+    }
+    state.offlineReady = ready
+}
+
+def offlineOperationAllowed() {
+    return settings.allowOffline != false && (state.offlineReady || hasAnyLocalSerial())
+}
+
+def hasAnyLocalSerial() {
+    return (state.knownSerials ?: []).any { serial ->
+        canUseLocal(serial as String, true)
+    }
+}
+
+def tryEnterOfflineMode(String reason) {
+    if (!offlineOperationAllowed()) return false
+    log.warn "Entering offline local mode: ${reason}"
+    state.cloudOffline = true
+    return true
+}
+
+def scheduleOfflineCloudProbe() {
+    if (!offlineOperationAllowed()) return
+    runIn((OFFLINE_PROBE_MS / 1000L) as Long, "offlineCloudProbe", [overwrite: true])
+}
+
+def offlineCloudProbe() {
+    if (!offlineOperationAllowed()) return
+    if (!state.cloudOffline) {
+        scheduleOfflineCloudProbe()
+        return
+    }
+    if (tokenIsFresh()) {
+        state.cloudOffline = false
+        state.lastCloudContact = new Date().format("yyyy-MM-dd HH:mm:ss")
+        discoverZones()
+        return
+    }
+    loginWithPassword()
+    scheduleOfflineCloudProbe()
+}
+
+def canUseLocal(String serial, Boolean ignoreDegrade = false) {
+    if (!serial) return false
+    if (state.cloudOffline && offlineOperationAllowed()) {
+        return localCredsComplete(serial)
+    }
+    if (settings.preferLocal == false) return false
+    if (!ignoreDegrade && localDegraded(serial)) return false
+    return localCredsComplete(serial)
+}
+
+def localCredsComplete(String serial) {
+    def creds = state.localCreds[serial]
+    return creds instanceof Map && creds.password && creds.cryptoSerial && creds.address
+}
+
+def localDegraded(String serial) {
+    def until = (state.localDegradedUntil[serial] ?: 0L) as long
+    return until > now()
+}
+
+def recordLocalSuccess(String serial) {
+    state.localFailCounts[serial] = 0
+    state.lastConnectionPath[serial] = state.cloudOffline ? "offline" : "local"
+}
+
+def recordLocalFailure(String serial) {
+    def fails = ((state.localFailCounts[serial] ?: 0) as int) + 1
+    state.localFailCounts[serial] = fails
+    if (!state.cloudOffline && fails >= LOCAL_FAIL_THRESHOLD) {
+        state.localDegradedUntil[serial] = now() + LOCAL_DEGRADE_MS
+        def creds = state.localCreds[serial]
+        if (creds instanceof Map && !creds.addressLocked) {
+            creds.remove("address")
+        }
+    }
+    if (state.cloudOffline) {
+        pushCloudStatus(serial, "offline")
+    }
+}
+
+def hexToBytes(String hex) {
+    if (!hex) return new byte[0]
+    def clean = hex.trim()
+    byte[] data = new byte[clean.length() / 2]
+    for (int i = 0; i < clean.length(); i += 2) {
+        data[i / 2] = (byte) Integer.parseInt(clean.substring(i, i + 2), 16)
+    }
+    return data
+}
+
+def bytesToHex(byte[] bytes) {
+    StringBuilder sb = new StringBuilder(bytes.length * 2)
+    for (int i = 0; i < bytes.length; i++) {
+        sb.append(String.format("%02x", bytes[i] & 0xff))
+    }
+    return sb.toString()
+}
+
+def sha256Bytes(byte[] data) {
+    MessageDigest md = MessageDigest.getInstance("SHA-256")
+    return md.digest(data)
+}
+
+def concatBytes(byte[] a, byte[] b) {
+    byte[] out = new byte[a.length + b.length]
+    System.arraycopy(a, 0, out, 0, a.length)
+    System.arraycopy(b, 0, out, a.length, b.length)
+    return out
+}
+
+def computeKumoToken(String passwordB64, String cryptoSerialHex, String bodyStr) {
+    try {
+        byte[] password = passwordB64.decodeBase64()
+        byte[] postData = bodyStr.getBytes("UTF-8")
+        byte[] dataHash = sha256Bytes(concatBytes(password, postData))
+        byte[] wParam = hexToBytes(W_PARAM_HEX)
+        byte[] cryptoSerial = hexToBytes(cryptoSerialHex)
+        if (cryptoSerial.length < CRYPTO_SERIAL_MIN_BYTES) return null
+
+        byte[] intermediate = new byte[88]
+        System.arraycopy(wParam, 0, intermediate, 0, 32)
+        System.arraycopy(dataHash, 0, intermediate, 32, 32)
+        intermediate[64] = (byte) 0x08
+        intermediate[65] = (byte) 0x40
+        intermediate[66] = (byte) 0x00
+        intermediate[79] = cryptoSerial[8]
+        System.arraycopy(cryptoSerial, 4, intermediate, 80, 4)
+        System.arraycopy(cryptoSerial, 0, intermediate, 84, 4)
+        return bytesToHex(sha256Bytes(intermediate))
+    } catch (Exception e) {
+        log.error "computeKumoToken failed: ${e.message}"
+        return null
+    }
+}
+
+def localPut(String serial, String bodyStr, Map ctx) {
+    def creds = state.localCreds[serial]
+    if (!(creds instanceof Map)) return false
+    if (state.localInFlight[serial]) return false
+    def token = computeKumoToken(creds.password as String, creds.cryptoSerial as String, bodyStr)
+    if (!token) return false
+    def ip = (ctx?.overrideIp ?: creds.address) as String
+    if (!ip) return false
+    state.localInFlight[serial] = true
+    def params = [
+        uri: "http://${ip}/api?m=${token}",
+        headers: [
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json"
+        ],
+        body: bodyStr,
+        contentType: "application/json",
+        requestContentType: "application/json",
+        timeout: LOCAL_HTTP_TIMEOUT
+    ]
+    asynchttpPut("localHttpCallback", params, ctx + [serial: serial, bodyStr: bodyStr, retry: ctx?.retry ?: 0])
+    return true
+}
+
+def localHttpCallback(response, data) {
+    def serial = data?.serial as String
+    if (!serial) return
+    def status = safeStatus(response)
+    def parsed = (status >= 200 && status < 300) ? parseAsyncBody(response) : null
+    def ok = parsed instanceof Map && parsed.r != null
+
+    if (!ok && (data.retry as int) < 1 && (status == 0 || status == 408)) {
+        state.localInFlight[serial] = false
+        runIn(1, "localPutRetry", [data: data + [retry: 1], overwrite: false])
+        return
+    }
+
+    state.localInFlight[serial] = false
+    state.ipProbeActive?.remove(serial)
+    if (ok) {
+        recordLocalSuccess(serial)
+        dispatchLocalResponse(data.requestType as String, parsed, data)
+    } else {
+        if (data.requestType != "localProbe") {
+            recordLocalFailure(serial)
+        }
+        dispatchLocalResponse(data.requestType as String, null, data)
+    }
+}
+
+def localPutRetry(data) {
+    def serial = data?.serial as String
+    if (!serial) return
+    localPut(serial, data.bodyStr as String, data as Map)
+}
+
+def dispatchLocalResponse(String type, parsed, Map data) {
+    def serial = data?.serial as String
+    if (!serial) return
+    switch (type) {
+        case "localWireless":
+            if (parsed) applyLocalWirelessResponse(serial, parsed)
+            runIn(1, "localPollProfileDelayed", [data: [serial: serial], overwrite: false])
+            break
+        case "localCommand":
+            handleLocalCommandResponse(serial, parsed != null)
+            break
+        case "localProbe":
+            if (parsed) {
+                ensureLocalCredEntry(serial)
+                state.localCreds[serial].address = data.probeIp as String
+                recomputeOfflineReady()
+                log.info "Matched ${tailSerial(serial)} to IP ${data.probeIp}"
+                state.ipProbeSerialIdx = ((state.ipProbeSerialIdx ?: 0) as int) + 1
+                state.ipProbeIpIdx = 0
+            }
+            break
+        case "localProfile":
+            if (parsed) applyLocalProfileResponse(serial, parsed)
+            else runIn(1, "localPollAdapterDelayed", [data: [serial: serial], overwrite: false])
+            break
+        case "localAdapter":
+            if (parsed) applyLocalAdapterResponse(serial, parsed)
+            break
+        case "localStatus":
+            if (parsed) applyLocalStatusResponse(serial, parsed)
+            else handleLocalPollFailure(serial)
+            break
+        default:
+            logDebug "Unhandled local response ${type}"
+    }
+}
+
+def applyLocalStatusResponse(String serial, Map parsed) {
+    def raw = parsed?.r?.indoorUnit?.status
+    if (!(raw instanceof Map)) {
+        handleLocalPollFailure(serial)
+        return
+    }
+    def device = (state.deviceData[serial] instanceof Map) ? (state.deviceData[serial] as Map) : [:]
+    applyCommandCacheToDevice(serial, device)
+    device.operationMode = raw.mode
+    device.airDirection = raw.vaneDir
+    device.fanSpeed = raw.fanSpeed
+    device.spHeat = raw.spHeat
+    device.spCool = raw.spCool
+    device.roomTemp = raw.roomTemp
+    device.connected = true
+  if (raw.filterDirty != null) device.filterDirty = raw.filterDirty
+    state.deviceData[serial] = device
+    state.failCounts[serial] = 0
+    pushStateToChildren(serial)
+    if (state.zoneIndex[serial]?.hasSensor) {
+        runIn(1, "localPollWirelessDelayed", [data: [serial: serial], overwrite: false])
+    } else {
+        runIn(1, "localPollProfileDelayed", [data: [serial: serial], overwrite: false])
+    }
+}
+
+def localPollWirelessDelayed(data) {
+    def serial = data?.serial as String
+    if (serial) localPollWireless(serial)
+}
+
+def localPollProfileDelayed(data) {
+    localPollProfile(data?.serial as String)
+}
+
+def localPollAdapterDelayed(data) {
+    localPollAdapter(data?.serial as String)
+}
+
+def applyLocalProfileResponse(String serial, Map parsed) {
+    def profile = parsed?.r?.indoorUnit?.profile
+    if (profile instanceof Map) {
+        state.profiles[serial] = profile
+        pushThermostatState(serial)
+    }
+    runIn(1, "localPollAdapterDelayed", [data: [serial: serial], overwrite: false])
+}
+
+def applyLocalAdapterResponse(String serial, Map parsed) {
+    def adapterStatus = parsed?.r?.adapter?.status
+    def adapterInfo = parsed?.r?.adapter?.info
+    def status = (state.statusData[serial] instanceof Map) ? (state.statusData[serial] as Map) : [:]
+    if (adapterStatus instanceof Map) {
+        try {
+            status.routerRssi = adapterStatus.localNetwork?.stationMode?.RSSI
+        } catch (ignored) {}
+        status.runState = adapterStatus.runState
+        state.statusData[serial] = status
+        pushDiagnosticState(serial)
+        // Follow with adapter info for firmware/hardware (separate PUT).
+        runIn(1, "localPollAdapterInfoDelayed", [data: [serial: serial], overwrite: false])
+        return
+    }
+    if (adapterInfo instanceof Map) {
+        status.firmwareVersion = adapterInfo.firmwareVersion
+        status.hardwareVersion = adapterInfo.hardwareVersion
+        state.statusData[serial] = status
+        pushDiagnosticState(serial)
+    }
+}
+
+def localPollAdapterInfoDelayed(data) {
+    def serial = data?.serial as String
+    if (serial) localPollAdapterInfo(serial)
+}
+
+def applyLocalWirelessResponse(String serial, Map parsed) {
+    def sensors = parsed?.r?.sensors
+    if (!(sensors instanceof Map)) return
+    def matched = null
+    sensors.each { k, v ->
+        if (matched == null && v instanceof Map && v.uuid) matched = v
+    }
+    if (matched instanceof Map) {
+        state.wirelessData[serial] = matched
+        pushWirelessState(serial)
+    }
+}
+
+def handleLocalPollFailure(String serial) {
+    def fails = ((state.failCounts[serial] ?: 0) as int) + 1
+    state.failCounts[serial] = fails
+    if (fails >= STALE_FAIL_THRESHOLD) {
+        pushCloudStatus(serial, "stale")
+    }
+    if (!state.cloudOffline && !localDegraded(serial)) {
+        apiGet("/devices/${serial}", [requestType: "device", serial: serial])
+    }
+}
+
+def handleLocalCommandResponse(String serial, Boolean ok) {
+    state.commandInFlight[serial] = false
+    if (ok) {
+        state.lastCommandSend[serial] = now()
+        state.lastCommandFields.remove(serial)
+        logDebug "Local command accepted for ${tailSerial(serial)}"
+        runIn(1, "refreshDeviceDetailLocalDelayed", [data: [serial: serial], overwrite: false])
+    } else {
+        log.error "Local command failed for ${tailSerial(serial)}"
+        def fields = state.lastCommandFields[serial]
+        def restore = [:]
+        if (fields instanceof List) {
+            fields.each { field ->
+                def entry = state.commandCache[serial]?[field]
+                if (entry?.value != null) restore[field] = entry.value
+            }
+        }
+        clearFailedCommandCache(serial)
+        if (state.deviceData[serial]) pushStateToChildren(serial)
+        if (!state.cloudOffline && !restore.isEmpty()) {
+            // Force cloud fallback for this command instead of tight local retries.
+            state.localDegradedUntil[serial] = now() + LOCAL_DEGRADE_MS
+            if (!(state.commandPending[serial] instanceof Map)) state.commandPending[serial] = [:]
+            restore.each { k, v -> state.commandPending[serial][k] = v }
+            processNextCommand(serial)
+        }
+    }
+    if (ok) processNextCommand(serial)
+}
+
+def localPollStatus(String serial) {
+    if (!canUseLocal(serial)) return
+    localPut(serial, LOCAL_STATUS_QUERY, [requestType: "localStatus"])
+}
+
+def localPollProfile(String serial) {
+    if (!canUseLocal(serial)) return
+    localPut(serial, LOCAL_PROFILE_QUERY, [requestType: "localProfile"])
+}
+
+def localPollAdapter(String serial) {
+    if (!canUseLocal(serial)) return
+    localPut(serial, LOCAL_ADAPTER_STATUS_QUERY, [requestType: "localAdapter"])
+}
+
+def localPollAdapterInfo(String serial) {
+    if (!canUseLocal(serial)) return
+    localPut(serial, LOCAL_ADAPTER_INFO_QUERY, [requestType: "localAdapter"])
+}
+
+def localPollWireless(String serial) {
+    if (!canUseLocal(serial)) return
+    localPut(serial, '{"c":{"sensors":{"0":{}}}}', [requestType: "localWireless"])
+}
+
+def cloudToLocalField(String cloudField) {
+    switch (cloudField) {
+        case "operationMode": return "mode"
+        case "airDirection": return "vaneDir"
+        default: return cloudField
+    }
+}
+
+def sendLocalCommands(String serial, Map cloudCommands) {
+    def localStatus = [:]
+    cloudCommands.each { k, v ->
+        localStatus[cloudToLocalField(k as String)] = v
+    }
+    def body = JsonOutput.toJson([c: [indoorUnit: [status: localStatus]])
+    if (!localPut(serial, body, [requestType: "localCommand"])) {
+        state.commandInFlight[serial] = false
+        if (!(state.commandPending[serial] instanceof Map)) state.commandPending[serial] = [:]
+        cloudCommands.each { k, v -> state.commandPending[serial][k] = v }
+        processNextCommand(serial)
+    }
+}
+
+// --- Socket.IO password fetch ---
+
+def startSocketIoPasswordFetch() {
+    if (state.cloudOffline || state.socketIoActive) return
+    def need = []
+    (state.knownSerials ?: []).each { serial ->
+        def s = serial as String
+        def creds = state.localCreds[s]
+        if (!(creds instanceof Map) || !creds.password) need << s
+    }
+    if (need.isEmpty()) return
+    state.socketIoActive = true
+    state.socketIoNeed = need
+    state.socketIoPasswords = [:]
+    state.socketIoDeadline = now() + 60000L
+    state.socketIoStep = "handshake"
+    socketIoHandshake()
+}
+
+def socketIoHandshake() {
+    try {
+        httpGet([
+            uri: "${SOCKET_BASE}/socket.io/",
+            query: [EIO: "4", transport: "polling"],
+            headers: ["Accept": "*/*", "Authorization": "Bearer ${atomicState.accessToken}"],
+            timeout: 15
+        ]) { response ->
+            def text = response?.data?.toString() ?: ""
+            if (!text.startsWith("0")) {
+                finishSocketIo("handshake failed")
+                return
+            }
+            def sid = new JsonSlurper().parseText(text.substring(1)).sid
+            state.socketIoSid = sid as String
+            state.socketIoStep = "connect"
+            socketIoPost("40")
+            runIn(1, "socketIoPoll", [overwrite: false])
+        }
+    } catch (Exception e) {
+        finishSocketIo("handshake error: ${e.message}")
+    }
+}
+
+def socketIoPost(String payload) {
+    try {
+        httpPost([
+            uri: "${SOCKET_BASE}/socket.io/",
+            query: [EIO: "4", transport: "polling", sid: state.socketIoSid],
+            headers: [
+                "Accept": "*/*",
+                "Authorization": "Bearer ${atomicState.accessToken}",
+                "Content-Type": "text/plain;charset=UTF-8"
+            ],
+            body: payload,
+            timeout: 10
+        ]) { response -> }
+    } catch (Exception e) {
+        log.warn "Socket.IO post failed: ${e.message}"
+    }
+}
+
+def socketIoPoll() {
+    if (!state.socketIoActive) return
+    if (now() > (state.socketIoDeadline ?: 0L)) {
+        finishSocketIo("timeout")
+        return
+    }
+    try {
+        httpGet([
+            uri: "${SOCKET_BASE}/socket.io/",
+            query: [EIO: "4", transport: "polling", sid: state.socketIoSid],
+            headers: ["Accept": "*/*", "Authorization": "Bearer ${atomicState.accessToken}"],
+            timeout: 25
+        ]) { response ->
+            def text = response?.data?.toString() ?: ""
+            socketIoHandleText(text)
+            if (state.socketIoActive) runIn(1, "socketIoPoll", [overwrite: false])
+        }
+    } catch (Exception e) {
+        finishSocketIo("poll error: ${e.message}")
+    }
+}
+
+def socketIoHandleText(String raw) {
+    if (!raw) return
+    def messages = raw.contains("\u001e") ? raw.split("\u001e") : [raw]
+    messages.each { msg ->
+        if (!msg) return
+        if (msg.contains(":") && msg.split(":")[0].isNumber()) {
+            msg = msg.split(":", 2)[1]
+        }
+        if (msg == "2") {
+            socketIoPost("3")
+            return
+        }
+        if (msg.startsWith("42")) {
+            try {
+                def payload = new JsonSlurper().parseText(msg.substring(2))
+                if (payload instanceof List && payload.size() >= 2 && payload[0] == "adapter_update") {
+                    def info = payload[1]
+                    if (info instanceof Map) {
+                        def s = info.deviceSerial as String
+                        def pw = info.password as String
+                        if (s && pw) {
+                            ensureLocalCredEntry(s)
+                            state.localCreds[s].password = pw
+                            state.socketIoPasswords[s] = pw
+                        }
+                    }
+                }
+            } catch (ignored) {}
+        }
+    }
+    if (state.socketIoStep == "connect") {
+        state.socketIoStep = "subscribed"
+        def userId = jwtUserId()
+        if (userId) socketIoPost("42[\"subscribe\",\"\",\"${userId}\"]")
+        (state.socketIoNeed ?: []).each { s ->
+            socketIoPost("42[\"subscribe\",\"${s}\"]")
+        }
+        (state.socketIoNeed ?: []).each { s ->
+            socketIoPost("42[\"force_adapter_request\",\"${s}\",\"adapterStatus\"]")
+        }
+        (state.socketIoNeed ?: []).each { s ->
+            socketIoPost("42[\"device_status_v2\",\"${s}\"]")
+        }
+    }
+    def need = state.socketIoNeed ?: []
+    def got = (state.socketIoPasswords ?: [:]).keySet()
+    if (need.every { it in got }) finishSocketIo("complete")
+}
+
+def jwtUserId() {
+    try {
+        def token = atomicState.accessToken as String
+        if (!token) return null
+        def parts = token.split("\\.")
+        if (parts.size() < 2) return null
+        // JWT uses URL-safe base64 (-/_); convert before standard decode.
+        def payloadB64 = (parts[1] as String).replace("-", "+").replace("_", "/")
+        def pad = payloadB64.length() % 4
+        if (pad > 0) payloadB64 += "=" * (4 - pad)
+        def json = new JsonSlurper().parseText(new String(payloadB64.decodeBase64(), "UTF-8"))
+        return json?.id?.toString()
+    } catch (Exception e) {
+        return null
+    }
+}
+
+def finishSocketIo(String reason) {
+    state.socketIoActive = false
+    log.info "Socket.IO password fetch finished: ${reason}"
+    recomputeOfflineReady()
+    if (settings.enableSubnetScan) startIpDiscovery()
+}
+
+// --- IP discovery ---
+
+def startIpDiscovery() {
+    def candidates = buildCandidateIpList()
+    if (!candidates) return
+    def serials = (state.knownSerials ?: []).findAll { serial ->
+        def s = serial as String
+        def creds = state.localCreds[s]
+        return creds instanceof Map && creds.password && creds.cryptoSerial && !creds.address
+    }
+    if (!serials) return
+    state.ipProbeSerials = serials
+    state.ipProbeCandidates = candidates
+    state.ipProbeSerialIdx = 0
+    state.ipProbeIpIdx = 0
+    scheduleNextIpProbe()
+}
+
+def scheduleNextIpProbe() {
+    def serials = state.ipProbeSerials ?: []
+    def candidates = state.ipProbeCandidates ?: []
+    def sIdx = (state.ipProbeSerialIdx ?: 0) as int
+    def iIdx = (state.ipProbeIpIdx ?: 0) as int
+
+    if (!serials || sIdx >= serials.size()) {
+        state.remove("ipProbeSerials")
+        state.remove("ipProbeCandidates")
+        state.remove("ipProbeSerialIdx")
+        state.remove("ipProbeIpIdx")
+        return
+    }
+
+    def serial = serials[sIdx] as String
+    if (state.localCreds[serial]?.address) {
+        state.ipProbeSerialIdx = sIdx + 1
+        state.ipProbeIpIdx = 0
+        runIn(1, "scheduleNextIpProbe", [overwrite: true])
+        return
+    }
+
+    if (iIdx >= candidates.size()) {
+        state.ipProbeSerialIdx = sIdx + 1
+        state.ipProbeIpIdx = 0
+        runIn(1, "scheduleNextIpProbe", [overwrite: true])
+        return
+    }
+
+    if (state.localInFlight[serial]) {
+        runIn(2, "scheduleNextIpProbe", [overwrite: true])
+        return
+    }
+
+    def ip = candidates[iIdx] as String
+    state.ipProbeIpIdx = iIdx + 1
+    state.ipProbeActive[serial] = true
+    localPut(serial, LOCAL_STATUS_QUERY, [requestType: "localProbe", probeIp: ip, probeSerial: serial, overrideIp: ip])
+    runIn(2, "scheduleNextIpProbe", [overwrite: true])
+}
+
+def buildCandidateIpList() {
+    def subnet = settings.subnetOverride?.trim()
+    if (!subnet) {
+        def hubIp = location?.hub?.ipAddress as String
+        if (!hubIp || !hubIp.contains(".")) return []
+        def parts = hubIp.split("\\.")
+        if (parts.size() != 4) return []
+        subnet = "${parts[0]}.${parts[1]}.${parts[2]}"
+    }
+    def list = []
+    for (int i = 1; i <= 254; i++) {
+        list << "${subnet}.${i}"
+    }
+    return list
 }
 
 def logDebug(msg) {

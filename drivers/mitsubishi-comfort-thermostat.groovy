@@ -14,6 +14,7 @@ metadata {
         attribute "supportedThermostatFanModes", "STRING"
         attribute "vanePosition", "STRING"
         attribute "cloudStatus", "STRING"
+        attribute "connectionPath", "STRING"
         attribute "comfortFanSpeed", "STRING"
         attribute "comfortMode", "STRING"
         attribute "minHeatingSetpoint", "NUMBER"
@@ -183,6 +184,9 @@ def applyThermostatState(Map st) {
     }
     if (st.cloudStatus != null) {
         sendEvent(name: "cloudStatus", value: st.cloudStatus)
+    }
+    if (st.connectionPath != null) {
+        sendEvent(name: "connectionPath", value: st.connectionPath)
     }
     if (st.model != null) {
         updateDataValue("model", st.model.toString())

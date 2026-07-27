@@ -1,16 +1,16 @@
 {
   "packageName": "Mitsubishi Comfort Cloud",
   "author": "evdev",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "minimumHEVersion": "2.3.0",
-  "dateReleased": "2026-07-26",
+  "dateReleased": "2026-07-27",
   "category": "Integrations",
   "tags": "Thermostats",
   "licenseFile": "https://raw.githubusercontent.com/evdev/mitsubishi-comfort-hubitat/main/LICENSE",
   "documentationLink": "https://github.com/evdev/mitsubishi-comfort-hubitat#readme",
   "communityLink": "https://github.com/evdev/mitsubishi-comfort-hubitat/issues",
   "gitHubUrl": "https://github.com/evdev/mitsubishi-comfort-hubitat",
-  "releaseNotes": "2026-07-26: 1.0.1 - Profile-driven fan modes (numberOfFanSpeeds, hasFanSpeedAuto); min/max setpoint attributes per mode on thermostat child; fan command validation against supported speeds.\n2026-07-26: 1.0.0 - Initial release: cloud thermostat control, indoor/wireless sensors, WiFi diagnostics, and filter reminder metadata.",
+  "releaseNotes": "2026-07-27: 1.1.0 - Hybrid local LAN control (pykumo protocol), offline local-only mode when internet is down, per-zone IP settings, connectionPath attribute on thermostat.\n2026-07-26: 1.0.1 - Profile-driven fan modes (numberOfFanSpeeds, hasFanSpeedAuto); min/max setpoint attributes per mode on thermostat child; fan command validation against supported speeds.\n2026-07-26: 1.0.0 - Initial release: cloud thermostat control, indoor/wireless sensors, WiFi diagnostics, and filter reminder metadata.",
   "apps": [
     {
       "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
@@ -19,7 +19,7 @@
       "location": "https://raw.githubusercontent.com/evdev/mitsubishi-comfort-hubitat/main/apps/mitsubishi-comfort-app.groovy",
       "required": true,
       "oauth": false,
-      "description": "Parent app for Mitsubishi Comfort / Kumo Cloud V3 integration"
+      "description": "Parent app for Mitsubishi Comfort / Kumo Cloud with hybrid local control"
     }
   ],
   "drivers": [

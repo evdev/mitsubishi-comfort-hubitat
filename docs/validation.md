@@ -65,3 +65,18 @@ Use this checklist after installing on a Hubitat hub with a real Comfort Cloud a
 
 - [ ] Stale children listed on app cleanup page
 - [ ] Manual deletion of stale child from Devices page succeeds
+
+## Local control
+
+- [ ] After cloud login, **Refresh local credentials** populates passwords (check logs)
+- [ ] Manual unit IP entry enables local polls (`connectionPath` = `local`)
+- [ ] Mode/setpoint/fan/vane commands work via local path
+- [ ] Local command latency is lower than cloud-only path
+- [ ] Cloud fallback works when local IP is wrong (degraded → `connectionPath` = `cloud`)
+
+## Offline local-only mode
+
+- [ ] With all IPs + cached creds, disconnect WAN: thermostats still poll and accept commands
+- [ ] `connectionPath` = `offline` while cloud is unreachable
+- [ ] Filter child retains last-known values (no cloud refresh)
+- [ ] Reconnect internet: app resumes cloud sync without re-entering credentials
