@@ -1912,8 +1912,12 @@ def handleLocalCommandResponse(String serial, Boolean ok) {
     if (fields instanceof List) {
         fields.each { field ->
             def cache = state.commandCache[serial]
-            def entry = cache instanceof Map ? cache[field] : null
-            if (entry?.value != null) restore[field] = entry.value
+            if (cache instanceof Map) {
+                def entry = cache[field]
+                if (entry instanceof Map && entry.value != null) {
+                    restore[field] = entry.value
+                }
+            }
         }
     }
     clearFailedCommandCache(serial)
@@ -1984,7 +1988,7 @@ def sendLocalCommands(String serial, Map cloudCommands) {
     cloudCommands.each { k, v ->
         localStatus[cloudToLocalField(k as String)] = v
     }
-    def body = JsonOutput.toJson([c: [indoorUnit: [status: localStatus]])
+    def body = JsonOutput.toJson([c: [indoorUnit: [status: localStatus]]])
     if (!localPut(serial, body, [requestType: "localCommand"])) {
         state.commandInFlight[serial] = false
         if (!(state.commandPending[serial] instanceof Map)) state.commandPending[serial] = [:]
