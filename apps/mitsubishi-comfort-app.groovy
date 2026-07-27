@@ -433,19 +433,25 @@ def maybeStartCredentialFetch() {
 def failPendingAuthRequests() {
     def queue = (state.pendingHttpQueue instanceof List) ? (state.pendingHttpQueue as List) : []
     state.pendingHttpQueue = []
+    def restoredSerials = [] as Set
     queue.each { pending ->
         if (pending?.ctx?.requestType == "command" && pending.ctx.serial) {
             def serial = pending.ctx.serial as String
             state.commandInFlight[serial] = false
-            // Restore commands so a later successful login can re-send them.
+            clearFailedCommandCache(serial)
+            // Restore into pending + cache so local/cloud retries can rebuild payloads.
             if (!(state.commandPending[serial] instanceof Map)) state.commandPending[serial] = [:]
             if (pending.body?.commands instanceof Map) {
-                pending.body.commands.each { k, v -> state.commandPending[serial][k] = v }
+                pending.body.commands.each { k, v ->
+                    state.commandPending[serial][k] = v
+                    cacheCommand(serial, k as String, v)
+                }
             }
-            clearFailedCommandCache(serial)
             if (state.deviceData[serial]) pushStateToChildren(serial)
+            restoredSerials << serial
         }
     }
+    restoredSerials.each { serial -> processNextCommand(serial as String) }
     log.error "Authentication failed; deferred cloud requests were not completed"
 }
 
@@ -510,18 +516,22 @@ def authCallback(response, data) {
             if (data?.action == "refresh") {
                 loginWithPassword()
             } else if (data?.action == "login") {
-                if (tryEnterOfflineMode("login failed")) {
+                def offline = tryEnterOfflineMode("login failed")
+                failPendingAuthRequests()
+                if (offline) {
                     onOfflineBoot(state.authNextStep ?: "resume")
-                } else {
-                    failPendingAuthRequests()
                 }
             }
         }
     } catch (Exception e) {
         atomicState.refreshInProgress = false
         log.error "Auth callback error: ${e.message}"
-        if (tryEnterOfflineMode("auth error")) {
+        def offline = tryEnterOfflineMode("auth error")
+        failPendingAuthRequests()
+        if (offline) {
             onOfflineBoot(state.authNextStep ?: "resume")
+        } else if (data?.action == "refresh") {
+            loginWithPassword()
         }
     }
 }
@@ -1325,7 +1335,9 @@ def processCommandQueue(data) {
     }
 
     if (state.cloudOffline) {
-        log.warn "Cannot send command for ${tailSerial(serial)}: offline and local credentials incomplete"
+        log.warn "Cannot send command for ${tailSerial(serial)}: offline and local credentials incomplete; will retry"
+        def waitSec = Math.max(30L, (COMMAND_GAP_MS / 1000L) as long)
+        runIn(waitSec, "processCommandQueue", [data: [serial: serial], overwrite: false])
         return
     }
 
@@ -1890,27 +1902,47 @@ def handleLocalCommandResponse(String serial, Boolean ok) {
         state.lastCommandFields.remove(serial)
         logDebug "Local command accepted for ${tailSerial(serial)}"
         runIn(1, "refreshDeviceDetailLocalDelayed", [data: [serial: serial], overwrite: false])
-    } else {
-        log.error "Local command failed for ${tailSerial(serial)}"
-        def fields = state.lastCommandFields[serial]
-        def restore = [:]
-        if (fields instanceof List) {
-            fields.each { field ->
-                def entry = state.commandCache[serial]?[field]
-                if (entry?.value != null) restore[field] = entry.value
-            }
-        }
-        clearFailedCommandCache(serial)
-        if (state.deviceData[serial]) pushStateToChildren(serial)
-        if (!state.cloudOffline && !restore.isEmpty()) {
-            // Force cloud fallback for this command instead of tight local retries.
-            state.localDegradedUntil[serial] = now() + LOCAL_DEGRADE_MS
-            if (!(state.commandPending[serial] instanceof Map)) state.commandPending[serial] = [:]
-            restore.each { k, v -> state.commandPending[serial][k] = v }
-            processNextCommand(serial)
+        processNextCommand(serial)
+        return
+    }
+
+    log.error "Local command failed for ${tailSerial(serial)}"
+    def fields = state.lastCommandFields[serial]
+    def restore = [:]
+    if (fields instanceof List) {
+        fields.each { field ->
+            def entry = state.commandCache[serial]?[field]
+            if (entry?.value != null) restore[field] = entry.value
         }
     }
-    if (ok) processNextCommand(serial)
+    clearFailedCommandCache(serial)
+
+    if (restore.isEmpty()) {
+        if (state.deviceData[serial]) pushStateToChildren(serial)
+        if (state.cloudOffline) {
+            runIn(1, "refreshDeviceDetailLocalDelayed", [data: [serial: serial], overwrite: false])
+        }
+        return
+    }
+
+    // Re-queue with cache so subsequent local failures can rebuild the payload again.
+    if (!(state.commandPending[serial] instanceof Map)) state.commandPending[serial] = [:]
+    restore.each { k, v ->
+        state.commandPending[serial][k] = v
+        cacheCommand(serial, k as String, v)
+    }
+    if (state.deviceData[serial]) pushStateToChildren(serial)
+
+    if (state.cloudOffline) {
+        runIn(1, "refreshDeviceDetailLocalDelayed", [data: [serial: serial], overwrite: false])
+        def waitSec = Math.max(1L, (COMMAND_GAP_MS / 1000L) as long)
+        runIn(waitSec, "processCommandQueue", [data: [serial: serial], overwrite: false])
+        return
+    }
+
+    // Force cloud fallback for this command instead of tight local retries.
+    state.localDegradedUntil[serial] = now() + LOCAL_DEGRADE_MS
+    processNextCommand(serial)
 }
 
 def localPollStatus(String serial) {
