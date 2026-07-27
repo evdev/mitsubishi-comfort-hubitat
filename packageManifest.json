@@ -1,0 +1,67 @@
+{
+  "packageName": "Mitsubishi Comfort Cloud",
+  "author": "evdev",
+  "version": "1.0.0",
+  "minimumHEVersion": "2.3.0",
+  "dateReleased": "2026-07-26",
+  "category": "Integrations",
+  "tags": "Thermostats",
+  "licenseFile": "https://raw.githubusercontent.com/evdev/mitsubishi-comfort-hubitat/main/LICENSE",
+  "documentationLink": "https://github.com/evdev/mitsubishi-comfort-hubitat#readme",
+  "communityLink": "https://github.com/evdev/mitsubishi-comfort-hubitat/issues",
+  "gitHubUrl": "https://github.com/evdev/mitsubishi-comfort-hubitat",
+  "releaseNotes": "Initial release: cloud thermostat control, indoor/wireless sensors, WiFi diagnostics, and filter reminder metadata.",
+  "apps": [
+    {
+      "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "name": "Mitsubishi Comfort",
+      "namespace": "ephrayim",
+      "location": "https://raw.githubusercontent.com/evdev/mitsubishi-comfort-hubitat/main/apps/mitsubishi-comfort-app.groovy",
+      "required": true,
+      "oauth": false,
+      "description": "Parent app for Mitsubishi Comfort / Kumo Cloud V3 integration"
+    }
+  ],
+  "drivers": [
+    {
+      "id": "b2c3d4e5-f6a7-8901-bcde-f12345678901",
+      "name": "Mitsubishi Comfort Thermostat",
+      "namespace": "ephrayim",
+      "location": "https://raw.githubusercontent.com/evdev/mitsubishi-comfort-hubitat/main/drivers/mitsubishi-comfort-thermostat.groovy",
+      "required": true,
+      "description": "Zone thermostat child device"
+    },
+    {
+      "id": "c3d4e5f6-a7b8-9012-cdef-123456789012",
+      "name": "Mitsubishi Comfort Indoor Sensor",
+      "namespace": "ephrayim",
+      "location": "https://raw.githubusercontent.com/evdev/mitsubishi-comfort-hubitat/main/drivers/mitsubishi-comfort-indoor-sensor.groovy",
+      "required": true,
+      "description": "Indoor temperature and humidity sensor"
+    },
+    {
+      "id": "d4e5f6a7-b8c9-0123-def0-234567890123",
+      "name": "Mitsubishi Comfort Wireless Sensor",
+      "namespace": "ephrayim",
+      "location": "https://raw.githubusercontent.com/evdev/mitsubishi-comfort-hubitat/main/drivers/mitsubishi-comfort-wireless-sensor.groovy",
+      "required": true,
+      "description": "Wireless room sensor (PAC-USWHS003-TH-1)"
+    },
+    {
+      "id": "e5f6a7b8-c9d0-1234-ef01-345678901234",
+      "name": "Mitsubishi Comfort Diagnostics",
+      "namespace": "ephrayim",
+      "location": "https://raw.githubusercontent.com/evdev/mitsubishi-comfort-hubitat/main/drivers/mitsubishi-comfort-diagnostics.groovy",
+      "required": true,
+      "description": "WiFi adapter firmware and signal diagnostics"
+    },
+    {
+      "id": "f6a7b8c9-d0e1-2345-f012-456789012345",
+      "name": "Mitsubishi Comfort Filter Reminder",
+      "namespace": "ephrayim",
+      "location": "https://raw.githubusercontent.com/evdev/mitsubishi-comfort-hubitat/main/drivers/mitsubishi-comfort-filter-sensor.groovy",
+      "required": true,
+      "description": "Filter reminder configuration and history"
+    }
+  ]
+}
