@@ -11,6 +11,8 @@ import groovy.transform.Field
 import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
 import java.security.MessageDigest
+import org.apache.commons.codec.binary.Base64
+import hubitat.helper.HexUtils
 
 definition(
     name: "Mitsubishi Comfort",
@@ -1649,59 +1651,43 @@ def recordLocalFailure(String serial) {
 
 def hexToBytes(String hex) {
     if (!hex) return new byte[0]
-    def clean = hex.trim()
-    byte[] data = new byte[clean.length() / 2]
-    for (int i = 0; i < clean.length(); i += 2) {
-        data[i / 2] = (byte) Integer.parseInt(clean.substring(i, i + 2), 16)
-    }
-    return data
+    return HexUtils.hexStringToByteArray(hex.trim())
 }
 
 def bytesToHex(byte[] bytes) {
-    StringBuilder sb = new StringBuilder(bytes.length * 2)
-    for (int i = 0; i < bytes.length; i++) {
-        sb.append(String.format("%02x", bytes[i] & 0xff))
-    }
-    return sb.toString()
+    return HexUtils.byteArrayToHexString(bytes).toLowerCase()
 }
 
 def sha256Bytes(byte[] data) {
+    return MessageDigest.getInstance("SHA-256").digest(data)
+}
+
+def sha256Concat(byte[] a, byte[] b) {
     MessageDigest md = MessageDigest.getInstance("SHA-256")
-    return md.digest(data)
-}
-
-def copyBytes(byte[] src, int srcOff, byte[] dest, int destOff, int len) {
-    for (int i = 0; i < len; i++) {
-        dest[destOff + i] = src[srcOff + i]
-    }
-}
-
-def concatBytes(byte[] a, byte[] b) {
-    byte[] out = new byte[a.length + b.length]
-    copyBytes(a, 0, out, 0, a.length)
-    copyBytes(b, 0, out, a.length, b.length)
-    return out
+    md.update(a)
+    md.update(b)
+    return md.digest()
 }
 
 def computeKumoToken(String passwordB64, String cryptoSerialHex, String bodyStr) {
     try {
-        byte[] password = passwordB64.decodeBase64()
+        byte[] password = Base64.decodeBase64(passwordB64)
         byte[] postData = bodyStr.getBytes("UTF-8")
-        byte[] dataHash = sha256Bytes(concatBytes(password, postData))
-        byte[] wParam = hexToBytes(W_PARAM_HEX)
-        byte[] cryptoSerial = hexToBytes(cryptoSerialHex)
-        if (cryptoSerial.length < CRYPTO_SERIAL_MIN_BYTES) return null
+        byte[] dataHash = sha256Concat(password, postData)
+        String serialHex = cryptoSerialHex.trim().toLowerCase()
+        if (serialHex.length() < CRYPTO_SERIAL_MIN_BYTES * 2) return null
 
-        byte[] intermediate = new byte[88]
-        copyBytes(wParam, 0, intermediate, 0, 32)
-        copyBytes(dataHash, 0, intermediate, 32, 32)
-        intermediate[64] = (byte) 0x08
-        intermediate[65] = (byte) 0x40
-        intermediate[66] = (byte) 0x00
-        intermediate[79] = cryptoSerial[8]
-        copyBytes(cryptoSerial, 4, intermediate, 80, 4)
-        copyBytes(cryptoSerial, 0, intermediate, 84, 4)
-        return bytesToHex(sha256Bytes(intermediate))
+        // Build the 88-byte intermediate buffer as hex (avoids System.arraycopy in sandbox).
+        StringBuilder sb = new StringBuilder(176)
+        sb.append(W_PARAM_HEX)
+        sb.append(bytesToHex(dataHash))
+        sb.append("084000")
+        for (int i = 0; i < 12; i++) sb.append("00")
+        sb.append(serialHex.substring(16, 18))
+        sb.append(serialHex.substring(8, 16))
+        sb.append(serialHex.substring(0, 8))
+
+        return bytesToHex(sha256Bytes(hexToBytes(sb.toString())))
     } catch (Exception e) {
         log.error "computeKumoToken failed: ${e.message}"
         return null
