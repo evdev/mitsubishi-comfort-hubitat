@@ -1911,7 +1911,8 @@ def handleLocalCommandResponse(String serial, Boolean ok) {
     def restore = [:]
     if (fields instanceof List) {
         fields.each { field ->
-            def entry = state.commandCache[serial]?[field]
+            def cache = state.commandCache[serial]
+            def entry = cache instanceof Map ? cache[field] : null
             if (entry?.value != null) restore[field] = entry.value
         }
     }
