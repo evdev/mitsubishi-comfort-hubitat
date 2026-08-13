@@ -44,6 +44,7 @@ definition(
 @Field static final String LOCAL_PROFILE_QUERY = '{"c":{"indoorUnit":{"profile":{}}}}'
 @Field static final String LOCAL_ADAPTER_STATUS_QUERY = '{"c":{"adapter":{"status":{}}}}'
 @Field static final String LOCAL_ADAPTER_INFO_QUERY = '{"c":{"adapter":{"info":{}}}}'
+@Field static final String LOCAL_MHK2_QUERY = '{"c":{"mhk2":{"status":{}}}}'
 @Field static final String W_PARAM_HEX = "44c73283b498d432ff25f5c8e06a016aef931e68f0a00ea710e36e6338fb22db"
 
 @Field static final Map F_TO_C = [
@@ -168,19 +169,19 @@ def mainPage() {
         }
         section("Diagnostics") {
             input name: "debugLogging", type: "bool", title: "Debug logging (auto-off after 30 min)", defaultValue: false
-            href name: "cleanupPage", title: "Stale child cleanup", description: "List children no longer on your account"
+            href name: "cleanupPage", title: "Stale child cleanup", description: "List thermostats no longer on your account"
         }
     }
 }
 
 def cleanupPage() {
     dynamicPage(name: "cleanupPage", title: "Stale child cleanup", uninstall: false, install: false) {
-        section("Children marked stale") {
+        section("Thermostats marked stale") {
             def stale = getStaleChildren()
             if (!stale || stale.isEmpty()) {
-                paragraph "No stale children. Stale devices are children whose zone no longer appears on your Comfort Cloud account."
+                paragraph "No stale thermostats. Stale devices are zone thermostats whose zone no longer appears on your Comfort Cloud account."
             } else {
-                paragraph "The following children are marked stale. Remove them from the Devices page if you no longer need them."
+                paragraph "The following thermostats are marked stale. Remove the thermostat from the Devices page if you no longer need it; nested indoor, filter, diagnostics, and wireless components are removed with it."
                 stale.each { child ->
                     paragraph "${child.label ?: child.name} — DNI: ${child.deviceNetworkId}"
                 }
@@ -225,6 +226,7 @@ def initializeApp(Boolean fullInit) {
     unschedule()
     state.pollingScheduled = false
     ensureStateMaps()
+    ensureAllZoneChildren()
 
     if (settings.debugLogging) {
         runIn(1800, "debugOff", [overwrite: true])
@@ -777,12 +779,14 @@ def discoverZones() {
 }
 
 def refreshAllDeviceDetails() {
+    ensureAllZoneChildren()
     (state.knownSerials ?: []).each { serial ->
         refreshDeviceDetail(serial as String)
     }
 }
 
 def refreshAllDeviceDetailsLocal() {
+    ensureAllZoneChildren()
     (state.knownSerials ?: []).eachWithIndex { serial, idx ->
         runIn(idx as Long, "refreshDeviceDetailLocalDelayed", [data: [serial: serial], overwrite: false])
     }
@@ -825,11 +829,26 @@ def handleZonesResponse(int status, parsed) {
         def zoneId = zone.id as String
         def zoneName = (zone.name ?: "Zone ${zoneId}") as String
         def hasSensor = zone.adapter.hasSensor == true
+        def hasMhk2 = zone.adapter.hasMhk2 == true
 
         activeSerials << serial
-        state.zoneIndex[serial] = [zoneId: zoneId, zoneName: zoneName, hasSensor: hasSensor]
+        state.zoneIndex[serial] = [
+            zoneId: zoneId,
+            zoneName: zoneName,
+            hasSensor: hasSensor,
+            hasMhk2: hasMhk2,
+            humidity: zone.adapter.humidity
+        ]
+        if (zone.adapter.humidity != null) {
+            def device = (state.deviceData[serial] instanceof Map) ? (state.deviceData[serial] as Map) : [:]
+            device.humidity = zone.adapter.humidity
+            state.deviceData[serial] = device
+        }
 
         ensureZoneChildren(serial, zoneId, zoneName, hasSensor)
+        if (state.deviceData[serial] instanceof Map) {
+            pushIndoorState(serial)
+        }
         refreshDeviceDetail(serial)
         apiGet("/devices/${serial}/profile", [requestType: "profile", serial: serial])
         apiGet("/devices/${serial}/status", [requestType: "status", serial: serial])
@@ -850,23 +869,51 @@ def handleZonesResponse(int status, parsed) {
     }
 }
 
+def ensureAllZoneChildren() {
+    (state.zoneIndex ?: [:]).each { serial, info ->
+        if (!info?.zoneId) return
+        ensureZoneChildren(
+            serial as String,
+            info.zoneId as String,
+            (info.zoneName ?: "Zone") as String,
+            info.hasSensor == true
+        )
+    }
+}
+
 def ensureZoneChildren(String serial, String zoneId, String zoneName, Boolean hasSensor) {
-    ensureChild("mc-${serial}-thermostat", "Mitsubishi Comfort Thermostat", "${zoneName} Thermostat", [
+    def tstat = ensureChild("mc-${serial}-thermostat", "Mitsubishi Comfort Thermostat", "${zoneName} Thermostat", [
         deviceSerial: serial, zoneId: zoneId, deviceType: "thermostat"
     ])
-    ensureChild("mc-${serial}-indoor", "Mitsubishi Comfort Indoor Sensor", "${zoneName} Indoor", [
-        deviceSerial: serial, zoneId: zoneId, deviceType: "indoor"
-    ])
-    ensureChild("mc-${serial}-diag", "Mitsubishi Comfort Diagnostics", "${zoneName} Diagnostics", [
-        deviceSerial: serial, zoneId: zoneId, deviceType: "diag"
-    ])
-    ensureChild("mc-${zoneId}-filter", "Mitsubishi Comfort Filter Reminder", "${zoneName} Filter", [
-        deviceSerial: serial, zoneId: zoneId, deviceType: "filter"
-    ])
-    if (hasSensor) {
-        ensureChild("mc-${serial}-wireless", "Mitsubishi Comfort Wireless Sensor", "${zoneName} Wireless", [
-            deviceSerial: serial, zoneId: zoneId, deviceType: "wireless"
+    if (!tstat) return
+    migrateLegacyAppChildren(serial, zoneId)
+    try {
+        tstat.ensureComponents([
+            serial: serial,
+            zoneId: zoneId,
+            zoneName: zoneName,
+            hasSensor: hasSensor
         ])
+    } catch (Exception e) {
+        log.error "Failed to ensure components for ${tailSerial(serial)}: ${e.message}"
+    }
+}
+
+def migrateLegacyAppChildren(String serial, String zoneId) {
+    [
+        "mc-${serial}-indoor",
+        "mc-${serial}-diag",
+        "mc-${zoneId}-filter",
+        "mc-${serial}-wireless"
+    ].each { dni ->
+        def child = getChildDevice(dni)
+        if (!child) return
+        log.info "Migrating: removing legacy app child ${child.label} (${dni})"
+        try {
+            deleteChildDevice(dni)
+        } catch (Exception e) {
+            log.error "Failed to remove legacy child ${dni}: ${e.message}"
+        }
     }
 }
 
@@ -890,16 +937,24 @@ def ensureChild(String dni, String driverName, String label, Map dataValues) {
 }
 
 def markMissingSerialsStale(Set activeSerials) {
-    getChildDevices()?.each { child ->
-        def serial = child.getDataValue("deviceSerial")
+    getChildDevices()?.each { tstat ->
+        if (tstat.getDataValue("deviceType") && tstat.getDataValue("deviceType") != "thermostat") return
+        def serial = tstat.getDataValue("deviceSerial")
         if (serial && !(serial in activeSerials)) {
-            child.sendEvent(name: "cloudStatus", value: "stale")
+            try {
+                tstat.pushCloudStatus("stale")
+            } catch (Exception e) {
+                tstat.sendEvent(name: "cloudStatus", value: "stale")
+                log.error "Failed to mark components stale for ${tailSerial(serial)}: ${e.message}"
+            }
         }
     }
 }
 
 def getStaleChildren() {
-    return getChildDevices()?.findAll { it.currentValue("cloudStatus") == "stale" } ?: []
+    return getChildDevices()?.findAll {
+        it.getDataValue("deviceType") == "thermostat" && it.currentValue("cloudStatus") == "stale"
+    } ?: []
 }
 
 // --- Response handlers ---
@@ -914,13 +969,7 @@ def handleDeviceResponse(int status, parsed, String serial) {
     } else {
         def fails = ((state.failCounts[serial] ?: 0) as int) + 1
         state.failCounts[serial] = fails
-        def device = state.deviceData[serial]
-        def cloudStatus = "online"
-        if (device instanceof Map && device.connected == false) {
-            cloudStatus = "offline"
-        } else if (fails >= STALE_FAIL_THRESHOLD) {
-            cloudStatus = "stale"
-        }
+        def cloudStatus = resolveCloudStatus(serial)
         if (cloudStatus != "online") {
             pushCloudStatus(serial, cloudStatus)
         }
@@ -996,17 +1045,44 @@ def pushStateToChildren(String serial) {
 }
 
 def pushCloudStatus(String serial, String cloudStatus) {
-    getChildrenForSerial(serial).each { child ->
-        child.sendEvent(name: "cloudStatus", value: cloudStatus)
+    def tstat = getThermostat(serial)
+    if (!tstat) return
+    try {
+        tstat.pushCloudStatus(cloudStatus)
+    } catch (Exception e) {
+        tstat.sendEvent(name: "cloudStatus", value: cloudStatus)
+        log.error "pushCloudStatus failed for ${tailSerial(serial)}: ${e.message}"
     }
 }
 
-def getChildrenForSerial(String serial) {
-    return getChildDevices()?.findAll { it.getDataValue("deviceSerial") == serial } ?: []
+def resolveCloudStatus(String serial) {
+    def fails = ((state.failCounts[serial] ?: 0) as int)
+    def path = state.lastConnectionPath[serial] as String
+    def talkingLocal = path == "local" || path == "offline"
+    if (talkingLocal && fails < STALE_FAIL_THRESHOLD) {
+        return "online"
+    }
+    if (fails >= STALE_FAIL_THRESHOLD) {
+        return "stale"
+    }
+    def device = state.deviceData[serial]
+    if (device instanceof Map && device.connected == false) {
+        return "offline"
+    }
+    return "online"
+}
+
+def roundHumidity(value) {
+    if (value == null) return null
+    return Math.round((value as double) * 10) / 10.0
+}
+
+def getThermostat(String serial) {
+    return getChildDevice("mc-${serial}-thermostat")
 }
 
 def pushThermostatState(String serial) {
-    def child = getChildDevice("mc-${serial}-thermostat")
+    def child = getThermostat(serial)
     if (!child) return
     def device = state.deviceData[serial]
     if (!(device instanceof Map)) return
@@ -1019,10 +1095,7 @@ def pushThermostatState(String serial) {
     def coolSp = cToDisplay(device.spCool)
     def fan = API_TO_UI_FAN[device.fanSpeed as String] ?: device.fanSpeed
     def vane = API_TO_UI_VANE[device.airDirection as String] ?: device.airDirection
-    def connected = device.connected != false
-    def cloudStatus = connected ?
-        (((state.failCounts[serial] ?: 0) as int) >= STALE_FAIL_THRESHOLD ? "stale" : "online") :
-        "offline"
+    def cloudStatus = resolveCloudStatus(serial)
 
     def supportedModes = buildSupportedModes(profile)
     def supportedFans = JsonOutput.toJson(buildSupportedFanModes(profile))
@@ -1054,6 +1127,11 @@ def pushThermostatState(String serial) {
             serialNumber: device.serialNumber
         ]
         stateMap.putAll(setpointLimits)
+        def display = (device.displayConfig instanceof Map) ? device.displayConfig : [:]
+        def defrost = device.defrost != null ? device.defrost : display.defrost
+        def standby = device.standby != null ? device.standby : display.standby
+        if (defrost != null) stateMap.defrost = defrost
+        if (standby != null) stateMap.standby = standby
         child.applyThermostatState(stateMap)
     } catch (Exception e) {
         log.error "pushThermostatState failed for ${tailSerial(serial)}: ${e.message}"
@@ -1061,25 +1139,28 @@ def pushThermostatState(String serial) {
 }
 
 def pushIndoorState(String serial) {
-    def child = getChildDevice("mc-${serial}-indoor")
+    def child = getThermostat(serial)
     if (!child) return
     def device = state.deviceData[serial]
     if (!(device instanceof Map)) return
+    def humidity = device.humidity != null ? device.humidity : state.zoneIndex[serial]?.humidity
     def map = [
         temperature: cToDisplay(device.roomTemp),
         tempUnit: useFahrenheit() ? "°F" : "°C",
-        cloudStatus: device.connected == false ? "offline" : "online"
+        cloudStatus: resolveCloudStatus(serial)
     ]
-    if (device.humidity != null) map.humidity = device.humidity
+    if (humidity != null) map.humidity = roundHumidity(humidity)
+    if (device.tempSource != null) map.tempSource = device.tempSource.toString()
+    if (device.activeThermistor != null) map.activeThermistor = device.activeThermistor.toString()
     try {
-        child.applyIndoorState(map)
+        child.forwardIndoorState(map)
     } catch (Exception e) {
         log.error "pushIndoorState failed: ${e.message}"
     }
 }
 
 def pushWirelessState(String serial) {
-    def child = getChildDevice("mc-${serial}-wireless")
+    def child = getThermostat(serial)
     if (!child) return
     def sensor = state.wirelessData[serial]
     if (!(sensor instanceof Map)) return
@@ -1091,13 +1172,13 @@ def pushWirelessState(String serial) {
             Math.round((tempC as double) * 10.0) / 10.0
     }
     try {
-        child.applyWirelessState([
+        child.forwardWirelessState([
             temperature: temp,
             tempUnit: useFahrenheit() ? "°F" : "°C",
-            humidity: sensor.humidity != null ? Math.round((sensor.humidity as double) * 10) / 10.0 : null,
+            humidity: roundHumidity(sensor.humidity),
             battery: sensor.battery,
             rssi: sensor.rssi,
-            cloudStatus: "online"
+            cloudStatus: resolveCloudStatus(serial)
         ])
     } catch (Exception e) {
         log.error "pushWirelessState failed: ${e.message}"
@@ -1105,16 +1186,16 @@ def pushWirelessState(String serial) {
 }
 
 def pushDiagnosticState(String serial) {
-    def child = getChildDevice("mc-${serial}-diag")
+    def child = getThermostat(serial)
     if (!child) return
     def status = state.statusData[serial]
     if (!(status instanceof Map)) return
     try {
-        child.applyDiagnosticState([
+        child.forwardDiagnosticState([
             rssi: status.routerRssi,
             firmwareVersion: status.firmwareVersion,
             routerSsid: status.routerSsid,
-            cloudStatus: "online"
+            cloudStatus: resolveCloudStatus(serial)
         ])
     } catch (Exception e) {
         log.error "pushDiagnosticState failed: ${e.message}"
@@ -1124,17 +1205,22 @@ def pushDiagnosticState(String serial) {
 def pushFilterState(String serial) {
     def zoneId = state.zoneIndex[serial]?.zoneId
     if (!zoneId) return
-    def child = getChildDevice("mc-${zoneId}-filter")
+    def child = getThermostat(serial)
     if (!child) return
     def notifications = state.notificationData[zoneId]
-    if (!(notifications instanceof Map)) return
+    def device = state.deviceData[serial]
+    def display = (device instanceof Map && device.displayConfig instanceof Map) ? device.displayConfig : [:]
+    def filterDirty = (device instanceof Map && device.filterDirty != null) ? device.filterDirty : display.filter
+    if (!(notifications instanceof Map) && filterDirty == null) return
+    def map = [cloudStatus: resolveCloudStatus(serial)]
+    if (filterDirty != null) map.filterDirty = filterDirty
+    if (notifications instanceof Map) {
+        map.lastFilterReminder = notifications.filterDirtyReminderLastSent
+        map.reminderIntervalDays = notifications.filterDirtyReminderInterval
+        map.remindersEnabled = notifications.filterDirty != null ? notifications.filterDirty.toString() : null
+    }
     try {
-        child.applyFilterState([
-            lastFilterReminder: notifications.filterDirtyReminderLastSent,
-            reminderIntervalDays: notifications.filterDirtyReminderInterval,
-            remindersEnabled: notifications.filterDirty != null ? notifications.filterDirty.toString() : null,
-            cloudStatus: "online"
-        ])
+        child.forwardFilterState(map)
     } catch (Exception e) {
         log.error "pushFilterState failed: ${e.message}"
     }
@@ -1765,6 +1851,10 @@ def dispatchLocalResponse(String type, parsed, Map data) {
     switch (type) {
         case "localWireless":
             if (parsed) applyLocalWirelessResponse(serial, parsed)
+            scheduleNextLocalPoll(serial, "wireless")
+            break
+        case "localMhk2":
+            if (parsed) applyLocalMhk2Response(serial, parsed)
             runIn(1, "localPollProfileDelayed", [data: [serial: serial], overwrite: false])
             break
         case "localCommand":
@@ -1811,20 +1901,39 @@ def applyLocalStatusResponse(String serial, Map parsed) {
     device.spCool = raw.spCool
     device.roomTemp = raw.roomTemp
     device.connected = true
-  if (raw.filterDirty != null) device.filterDirty = raw.filterDirty
+    if (raw.humidity != null) device.humidity = raw.humidity
+    if (raw.filterDirty != null) device.filterDirty = raw.filterDirty
+    if (raw.defrost != null) device.defrost = raw.defrost
+    if (raw.standby != null) device.standby = raw.standby
+    if (raw.tempSource != null) device.tempSource = raw.tempSource
+    if (raw.activeThermistor != null) device.activeThermistor = raw.activeThermistor
     state.deviceData[serial] = device
     state.failCounts[serial] = 0
     pushStateToChildren(serial)
-    if (state.zoneIndex[serial]?.hasSensor) {
-        runIn(1, "localPollWirelessDelayed", [data: [serial: serial], overwrite: false])
-    } else {
-        runIn(1, "localPollProfileDelayed", [data: [serial: serial], overwrite: false])
-    }
+    scheduleNextLocalPoll(serial, "status")
 }
 
 def localPollWirelessDelayed(data) {
     def serial = data?.serial as String
     if (serial) localPollWireless(serial)
+}
+
+def localPollMhk2Delayed(data) {
+    def serial = data?.serial as String
+    if (serial) localPollMhk2(serial)
+}
+
+def scheduleNextLocalPoll(String serial, String after) {
+    if (!serial) return
+    if (after == "status" && state.zoneIndex[serial]?.hasSensor) {
+        runIn(1, "localPollWirelessDelayed", [data: [serial: serial], overwrite: false])
+        return
+    }
+    if (after != "mhk2" && state.zoneIndex[serial]?.hasMhk2) {
+        runIn(1, "localPollMhk2Delayed", [data: [serial: serial], overwrite: false])
+        return
+    }
+    runIn(1, "localPollProfileDelayed", [data: [serial: serial], overwrite: false])
 }
 
 def localPollProfileDelayed(data) {
@@ -1885,11 +1994,24 @@ def applyLocalWirelessResponse(String serial, Map parsed) {
     }
 }
 
+def applyLocalMhk2Response(String serial, Map parsed) {
+    def humid = null
+    try {
+        humid = parsed?.r?.mhk2?.status?.indoorHumid
+    } catch (ignored) {}
+    if (humid == null) return
+    def device = (state.deviceData[serial] instanceof Map) ? (state.deviceData[serial] as Map) : [:]
+    device.humidity = humid
+    state.deviceData[serial] = device
+    pushIndoorState(serial)
+}
+
 def handleLocalPollFailure(String serial) {
     def fails = ((state.failCounts[serial] ?: 0) as int) + 1
     state.failCounts[serial] = fails
-    if (fails >= STALE_FAIL_THRESHOLD) {
-        pushCloudStatus(serial, "stale")
+    def cloudStatus = resolveCloudStatus(serial)
+    if (cloudStatus != "online") {
+        pushCloudStatus(serial, cloudStatus)
     }
     if (!state.cloudOffline && !localDegraded(serial)) {
         apiGet("/devices/${serial}", [requestType: "device", serial: serial])
@@ -1974,6 +2096,11 @@ def localPollAdapterInfo(String serial) {
 def localPollWireless(String serial) {
     if (!canUseLocal(serial)) return
     localPut(serial, '{"c":{"sensors":{"0":{}}}}', [requestType: "localWireless"])
+}
+
+def localPollMhk2(String serial) {
+    if (!canUseLocal(serial)) return
+    localPut(serial, LOCAL_MHK2_QUERY, [requestType: "localMhk2"])
 }
 
 def cloudToLocalField(String cloudField) {

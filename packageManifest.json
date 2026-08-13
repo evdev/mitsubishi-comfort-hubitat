@@ -1,7 +1,7 @@
 {
   "packageName": "Mitsubishi Comfort Cloud",
   "author": "evdev",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "minimumHEVersion": "2.3.0",
   "dateReleased": "2026-08-13",
   "category": "Integrations",
@@ -10,7 +10,7 @@
   "documentationLink": "https://github.com/evdev/mitsubishi-comfort-hubitat#readme",
   "communityLink": "https://github.com/evdev/mitsubishi-comfort-hubitat/issues",
   "gitHubUrl": "https://github.com/evdev/mitsubishi-comfort-hubitat",
-  "releaseNotes": "2026-08-13: 1.1.1 - Hubitat button actions for local credential/IP refresh, improved command retry on auth/local failures, and Kumo local auth token fixes for Hubitat runtime.\n2026-07-27: 1.1.0 - Hybrid local LAN control (pykumo protocol), offline local-only mode, per-zone IP settings, connectionPath attribute.\n2026-07-26: 1.0.1 - Profile-driven fan modes and setpoint limits.\n2026-07-26: 1.0.0 - Initial release.",
+  "releaseNotes": "2026-08-13: 1.2.0 - Nest indoor, filter, diagnostics, and wireless sensors under each zone thermostat. Upgrading recreates those satellite devices (thermostat IDs are unchanged).\n2026-08-13: 1.1.2 - Indoor humidity from zone/MHK2/cloud, shared cloudStatus, live filterDirty on the Filter child, and defrost/standby on the thermostat.\n2026-08-13: 1.1.1 - Hubitat button actions for local credential/IP refresh, improved command retry on auth/local failures, and Kumo local auth token fixes for Hubitat runtime.\n2026-07-27: 1.1.0 - Hybrid local LAN control (pykumo protocol), offline local-only mode, per-zone IP settings, connectionPath attribute.\n2026-07-26: 1.0.1 - Profile-driven fan modes and setpoint limits.\n2026-07-26: 1.0.0 - Initial release.",
   "apps": [
     {
       "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
@@ -29,7 +29,7 @@
       "namespace": "ephrayim",
       "location": "https://raw.githubusercontent.com/evdev/mitsubishi-comfort-hubitat/main/drivers/mitsubishi-comfort-thermostat.groovy",
       "required": true,
-      "description": "Zone thermostat child device"
+      "description": "Zone thermostat parent device"
     },
     {
       "id": "c3d4e5f6-a7b8-9012-cdef-123456789012",
@@ -37,7 +37,7 @@
       "namespace": "ephrayim",
       "location": "https://raw.githubusercontent.com/evdev/mitsubishi-comfort-hubitat/main/drivers/mitsubishi-comfort-indoor-sensor.groovy",
       "required": true,
-      "description": "Indoor temperature and humidity sensor"
+      "description": "Indoor temperature and humidity sensor (nested under the thermostat)"
     },
     {
       "id": "d4e5f6a7-b8c9-0123-def0-234567890123",
@@ -45,7 +45,7 @@
       "namespace": "ephrayim",
       "location": "https://raw.githubusercontent.com/evdev/mitsubishi-comfort-hubitat/main/drivers/mitsubishi-comfort-wireless-sensor.groovy",
       "required": true,
-      "description": "Wireless room sensor (PAC-USWHS003-TH-1)"
+      "description": "Wireless room sensor (PAC-USWHS003-TH-1, nested under the thermostat)"
     },
     {
       "id": "e5f6a7b8-c9d0-1234-ef01-345678901234",
@@ -53,7 +53,7 @@
       "namespace": "ephrayim",
       "location": "https://raw.githubusercontent.com/evdev/mitsubishi-comfort-hubitat/main/drivers/mitsubishi-comfort-diagnostics.groovy",
       "required": true,
-      "description": "WiFi adapter firmware and signal diagnostics"
+      "description": "WiFi adapter firmware and signal diagnostics (nested under the thermostat)"
     },
     {
       "id": "f6a7b8c9-d0e1-2345-f012-456789012345",
@@ -61,7 +61,7 @@
       "namespace": "ephrayim",
       "location": "https://raw.githubusercontent.com/evdev/mitsubishi-comfort-hubitat/main/drivers/mitsubishi-comfort-filter-sensor.groovy",
       "required": true,
-      "description": "Filter reminder configuration and history"
+      "description": "Filter dirty flag and reminder configuration (nested under the thermostat)"
     }
   ]
 }

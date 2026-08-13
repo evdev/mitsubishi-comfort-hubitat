@@ -16,9 +16,13 @@ Use this checklist after installing on a Hubitat hub with a real Comfort Cloud a
 
 ## Discovery
 
-- [ ] Each zone with an adapter gets thermostat, indoor, diagnostics, and filter children
-- [ ] Zones with `hasSensor` also get a wireless sensor child
+- [ ] Each zone with an adapter gets one app-owned thermostat
+- [ ] Indoor, diagnostics, and filter devices are nested children of that thermostat (not app siblings)
+- [ ] Zones with `hasSensor` also get a wireless sensor nested under the thermostat
+- [ ] Devices list can collapse the thermostat to hide nested components
 - [ ] Manual app update / hub restart does not duplicate children
+- [ ] Upgrade from 1.1.x: legacy app-owned indoor/filter/diagnostics/wireless devices are removed and recreated under the thermostat
+- [ ] Thermostat device IDs are unchanged after upgrade; satellite device IDs are new
 
 ## Thermostat control
 
@@ -43,17 +47,21 @@ Use this checklist after installing on a Hubitat hub with a real Comfort Cloud a
 ## Sensors
 
 - [ ] Indoor child reports room temperature
-- [ ] Indoor humidity appears when API provides `humidity`
+- [ ] Indoor humidity appears from zone/device `humidity` or local MHK2 `indoorHumid`
+- [ ] Indoor `cloudStatus` matches the thermostat (`online` / `offline` / `stale`)
+- [ ] Indoor extra attributes (`tempSource`, `activeThermistor`) appear only when the unit reports them
 - [ ] Wireless child reports temp, humidity, battery, RSSI (if sensor paired)
 - [ ] Diagnostics child reports firmware version and router RSSI
-- [ ] Filter child reports `lastFilterReminder` timestamp when configured
+- [ ] Filter child reports `filterDirty` when the unit reports it, plus `lastFilterReminder` when configured
+- [ ] Thermostat reports `defrost` / `standby` when the unit reports those flags
 
 ## Resilience
 
 - [ ] Transient API failure: last-known values retained
 - [ ] Three consecutive device-detail failures: `cloudStatus` = `stale`
-- [ ] API `connected: false`: `cloudStatus` = `offline`
-- [ ] Zone removed from account: children marked `stale`, not auto-deleted
+- [ ] API `connected: false` with no local path: `cloudStatus` = `offline`
+- [ ] Successful local poll: Indoor and thermostat `cloudStatus` = `online` even if cloud `connected` is stale
+- [ ] Zone removed from account: thermostat (and nested components) marked `stale`, not auto-deleted
 
 ## Automations
 
@@ -63,8 +71,8 @@ Use this checklist after installing on a Hubitat hub with a real Comfort Cloud a
 
 ## Cleanup
 
-- [ ] Stale children listed on app cleanup page
-- [ ] Manual deletion of stale child from Devices page succeeds
+- [ ] Stale thermostats listed on app cleanup page
+- [ ] Manual deletion of a stale thermostat from Devices page also removes nested components
 
 ## Local control
 

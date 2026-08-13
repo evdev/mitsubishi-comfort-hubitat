@@ -1,8 +1,9 @@
 /**
- * Mitsubishi Comfort Cloud — WiFi adapter diagnostics child driver.
+ * Mitsubishi Comfort Cloud — WiFi adapter diagnostics component driver.
+ * Nested under the zone thermostat parent device.
  */
 metadata {
-    definition(name: "Mitsubishi Comfort Diagnostics", namespace: "ephrayim", author: "ephrayim", importUrl: "https://github.com/evdev/mitsubishi-comfort-hubitat") {
+    definition(name: "Mitsubishi Comfort Diagnostics", namespace: "ephrayim", author: "ephrayim", importUrl: "https://github.com/evdev/mitsubishi-comfort-hubitat", component: true) {
         capability "Refresh"
         capability "Sensor"
         capability "Signal Strength"

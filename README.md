@@ -9,11 +9,11 @@ Hubitat Elevation integration for **Mitsubishi Comfort** / **Kumo Cloud** V3 HVA
 - Login with Comfort / Kumo Cloud credentials
 - Site selection for multi-site accounts
 - **Local LAN control** when unit IPs and credentials are cached (lower latency, works offline)
-- Per-zone thermostat control (mode, setpoints, fan, vane)
-- Indoor temperature and humidity sensors
+- Per-zone thermostat control (mode, setpoints, fan, vane; `defrost` / `standby` when reported)
+- Indoor temperature and humidity sensors (MHK2 / zone humidity when the unit reports it)
 - Wireless room sensor support (`hasSensor` zones)
 - WiFi adapter diagnostics (firmware, RSSI, router SSID)
-- Filter reminder metadata (last reminder date, interval, enabled flag)
+- Filter dirty flag plus reminder metadata (last reminder date, interval, enabled flag)
 
 ## Installation
 
@@ -46,7 +46,7 @@ Hubitat Elevation integration for **Mitsubishi Comfort** / **Kumo Cloud** V3 HVA
 6. Select your site when the dropdown appears
 7. Choose poll interval and tap **Done**
 
-Child devices are created automatically after the first successful discovery.
+Child devices are created automatically after the first successful discovery. Each zone appears as a thermostat; indoor, filter, diagnostics, and wireless sensors nest under that thermostat and can be collapsed in the Devices list.
 
 ### Manual install
 
@@ -57,13 +57,21 @@ Child devices are created automatically after the first successful discovery.
 
 ## Devices created per zone
 
-| Child device | Purpose |
-|---|---|
-| `{Zone} Thermostat` | HVAC control |
-| `{Zone} Indoor` | Built-in room temp / humidity |
-| `{Zone} Wireless` | External sensor (if paired) |
-| `{Zone} Diagnostics` | Adapter firmware / WiFi signal |
-| `{Zone} Filter` | Filter reminder metadata |
+The app creates one thermostat per HVAC zone. That thermostat then creates nested component devices:
+
+| Device | Parent | Purpose |
+|---|---|---|
+| `{Zone} Thermostat` | App | HVAC control; `defrost` / `standby` when reported |
+| `{Zone} Indoor` | Thermostat | Built-in room temp / humidity; `tempSource` / `activeThermistor` when reported |
+| `{Zone} Wireless` | Thermostat | External sensor (if paired) |
+| `{Zone} Diagnostics` | Thermostat | Adapter firmware / WiFi signal |
+| `{Zone} Filter` | Thermostat | Live `filterDirty` flag plus reminder metadata |
+
+In **Devices**, collapse a thermostat to hide its nested sensors. Component devices cannot be deleted or have their driver changed independently; removing the thermostat removes them.
+
+### Upgrading from 1.1.x
+
+Indoor, filter, diagnostics, and wireless devices are recreated as children of the thermostat. Thermostat device IDs are unchanged. Re-select the new satellite devices in Rule Machine, dashboards, and other apps that referenced the old ones. Open the Mitsubishi Comfort app and tap **Done**, or wait for the next poll, to run the migration.
 
 ## Fan speed mapping
 
@@ -95,7 +103,10 @@ Child devices are created automatically after the first successful discovery.
 - Extended modes `dry` and `fan` are exposed via `supportedThermostatModes` JSON. The Dashboard thermostat tile may honor these; **Rule Machine** standard thermostat actions may require **Custom Action** for nonstandard modes.
 - Custom commands `setComfortMode` and `setComfortFanSpeed` are reliable fallbacks for automations.
 - Vane control uses `setVanePosition` with Comfort app labels.
-- `cloudStatus` reports `online`, `offline`, or `stale`. Stale children are never auto-deleted.
+- `cloudStatus` reports `online`, `offline`, or `stale` on the thermostat and every nested component, using the same reachability rules. Stale thermostats are never auto-deleted.
+- Indoor humidity comes from Comfort Cloud (`humidity` on the zone or device) or a local MHK2 wall controller (`indoorHumid`). Wireless PAC humidity stays on the Wireless child.
+- Indoor `tempSource` / `activeThermistor` appear when the unit reports which sensor it is using.
+- Thermostat `defrost` / `standby` and Filter `filterDirty` appear when the unit reports those flags.
 - `connectionPath` on the thermostat reports `local`, `cloud`, or `offline` (local-only when internet is down).
 
 ## Local control
@@ -125,7 +136,7 @@ Enable **Debug logging** in app settings (auto-disables after 30 minutes). Check
 
 ## Uninstall
 
-Remove the app from **Apps**. Child devices are removed on uninstall. Stale children from prior configs can be deleted manually from **Devices**.
+Remove the app from **Apps**. Zone thermostats and their nested components are removed on uninstall. Stale thermostats from prior configs can be deleted manually from **Devices**.
 
 ## Credits
 

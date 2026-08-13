@@ -1,12 +1,13 @@
 /**
- * Mitsubishi Comfort Cloud — filter reminder metadata child driver.
- * Reports reminder configuration/history only; does not infer filter condition.
+ * Mitsubishi Comfort Cloud — filter reminder and live filter-dirty component driver.
+ * Nested under the zone thermostat parent device.
  */
 metadata {
-    definition(name: "Mitsubishi Comfort Filter Reminder", namespace: "ephrayim", author: "ephrayim", importUrl: "https://github.com/evdev/mitsubishi-comfort-hubitat") {
+    definition(name: "Mitsubishi Comfort Filter Reminder", namespace: "ephrayim", author: "ephrayim", importUrl: "https://github.com/evdev/mitsubishi-comfort-hubitat", component: true) {
         capability "Refresh"
         capability "Sensor"
 
+        attribute "filterDirty", "STRING"
         attribute "lastFilterReminder", "STRING"
         attribute "reminderIntervalDays", "NUMBER"
         attribute "remindersEnabled", "STRING"
@@ -38,6 +39,9 @@ def refresh() {
 
 def applyFilterState(Map st) {
     if (!st) return
+    if (st.filterDirty != null) {
+        sendEvent(name: "filterDirty", value: st.filterDirty.toString())
+    }
     if (st.lastFilterReminder != null) {
         sendEvent(name: "lastFilterReminder", value: st.lastFilterReminder.toString())
     }

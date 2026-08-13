@@ -1,6 +1,8 @@
 /**
- * Mitsubishi Comfort Cloud — zone thermostat child driver.
- * Parent app owns all cloud communication; this driver exposes Hubitat capabilities.
+ * Mitsubishi Comfort Cloud — zone thermostat parent driver.
+ * Parent app owns all cloud/LAN communication; this driver exposes Hubitat
+ * thermostat capabilities and creates nested indoor/filter/diagnostics/wireless
+ * component devices.
  */
 metadata {
     definition(name: "Mitsubishi Comfort Thermostat", namespace: "ephrayim", author: "ephrayim", importUrl: "https://github.com/evdev/mitsubishi-comfort-hubitat") {
@@ -13,6 +15,8 @@ metadata {
         attribute "supportedThermostatModes", "STRING"
         attribute "supportedThermostatFanModes", "STRING"
         attribute "vanePosition", "STRING"
+        attribute "defrost", "STRING"
+        attribute "standby", "STRING"
         attribute "cloudStatus", "STRING"
         attribute "connectionPath", "STRING"
         attribute "comfortFanSpeed", "STRING"
@@ -58,6 +62,101 @@ def initialize() {
 
 def refresh() {
     parent?.componentRefresh(device)
+}
+
+def componentRefresh(child) {
+    parent?.componentRefresh(child)
+}
+
+// --- Nested component devices ---
+
+def ensureComponents(Map opts) {
+    def serial = opts?.serial as String
+    def zoneId = opts?.zoneId as String
+    def zoneName = (opts?.zoneName ?: "Zone") as String
+    def hasSensor = opts?.hasSensor == true
+    if (!serial || !zoneId) return
+    ensureComponent("mc-${serial}-indoor", "Mitsubishi Comfort Indoor Sensor", "${zoneName} Indoor", [
+        deviceSerial: serial, zoneId: zoneId, deviceType: "indoor"
+    ])
+    ensureComponent("mc-${serial}-diag", "Mitsubishi Comfort Diagnostics", "${zoneName} Diagnostics", [
+        deviceSerial: serial, zoneId: zoneId, deviceType: "diag"
+    ])
+    ensureComponent("mc-${zoneId}-filter", "Mitsubishi Comfort Filter Reminder", "${zoneName} Filter", [
+        deviceSerial: serial, zoneId: zoneId, deviceType: "filter"
+    ])
+    if (hasSensor) {
+        ensureComponent("mc-${serial}-wireless", "Mitsubishi Comfort Wireless Sensor", "${zoneName} Wireless", [
+            deviceSerial: serial, zoneId: zoneId, deviceType: "wireless"
+        ])
+    }
+}
+
+def ensureComponent(String dni, String driverName, String label, Map dataValues) {
+    def child = getChildDevice(dni)
+    if (!child) {
+        try {
+            child = addChildDevice("ephrayim", driverName, dni, [label: label, name: label, isComponent: true])
+            log.info "Created component ${label} (${dni})"
+        } catch (Exception e) {
+            log.error "Failed to create component ${dni}: ${e.message}"
+            return null
+        }
+    } else if (child.label != label && !child.label) {
+        child.setLabel(label)
+    }
+    dataValues.each { k, v ->
+        if (v != null) child.updateDataValue(k as String, v.toString())
+    }
+    return child
+}
+
+def componentByType(String type) {
+    def serial = device.getDataValue("deviceSerial")
+    def zoneId = device.getDataValue("zoneId")
+    if (!serial) return null
+    def dni
+    switch (type) {
+        case "indoor":
+            dni = "mc-${serial}-indoor"
+            break
+        case "diag":
+            dni = "mc-${serial}-diag"
+            break
+        case "filter":
+            dni = zoneId ? "mc-${zoneId}-filter" : null
+            break
+        case "wireless":
+            dni = "mc-${serial}-wireless"
+            break
+        default:
+            return null
+    }
+    return dni ? getChildDevice(dni) : null
+}
+
+def forwardIndoorState(Map st) {
+    componentByType("indoor")?.applyIndoorState(st)
+}
+
+def forwardDiagnosticState(Map st) {
+    componentByType("diag")?.applyDiagnosticState(st)
+}
+
+def forwardFilterState(Map st) {
+    componentByType("filter")?.applyFilterState(st)
+}
+
+def forwardWirelessState(Map st) {
+    componentByType("wireless")?.applyWirelessState(st)
+}
+
+def pushCloudStatus(String cloudStatus) {
+    if (!cloudStatus) return
+    sendEvent(name: "cloudStatus", value: cloudStatus)
+    getChildDevices()?.each { child ->
+        child.sendEvent(name: "cloudStatus", value: cloudStatus)
+    }
 }
 
 // --- Thermostat capability commands ---
@@ -181,6 +280,12 @@ def applyThermostatState(Map st) {
     }
     if (st.vanePosition != null) {
         sendEvent(name: "vanePosition", value: st.vanePosition)
+    }
+    if (st.defrost != null) {
+        sendEvent(name: "defrost", value: st.defrost.toString())
+    }
+    if (st.standby != null) {
+        sendEvent(name: "standby", value: st.standby.toString())
     }
     if (st.cloudStatus != null) {
         sendEvent(name: "cloudStatus", value: st.cloudStatus)

@@ -1,14 +1,17 @@
 /**
- * Mitsubishi Comfort Cloud — indoor unit temperature/humidity child driver.
+ * Mitsubishi Comfort Cloud — indoor unit temperature/humidity component driver.
+ * Nested under the zone thermostat parent device.
  */
 metadata {
-    definition(name: "Mitsubishi Comfort Indoor Sensor", namespace: "ephrayim", author: "ephrayim", importUrl: "https://github.com/evdev/mitsubishi-comfort-hubitat") {
+    definition(name: "Mitsubishi Comfort Indoor Sensor", namespace: "ephrayim", author: "ephrayim", importUrl: "https://github.com/evdev/mitsubishi-comfort-hubitat", component: true) {
         capability "Refresh"
         capability "Sensor"
         capability "Temperature Measurement"
         capability "Relative Humidity Measurement"
 
         attribute "cloudStatus", "STRING"
+        attribute "tempSource", "STRING"
+        attribute "activeThermistor", "STRING"
     }
 
     preferences {
@@ -25,6 +28,11 @@ def updated() {
 }
 
 def initialize() {
+    ["filterDirty", "defrost", "standby"].each { name ->
+        if (device.currentValue(name) != null) {
+            device.deleteCurrentState(name)
+        }
+    }
     if (!device.currentValue("cloudStatus")) {
         sendEvent(name: "cloudStatus", value: "online")
     }
@@ -45,6 +53,12 @@ def applyIndoorState(Map st) {
     }
     if (st.cloudStatus != null) {
         sendEvent(name: "cloudStatus", value: st.cloudStatus)
+    }
+    if (st.tempSource != null) {
+        sendEvent(name: "tempSource", value: st.tempSource.toString())
+    }
+    if (st.activeThermistor != null) {
+        sendEvent(name: "activeThermistor", value: st.activeThermistor.toString())
     }
 }
 

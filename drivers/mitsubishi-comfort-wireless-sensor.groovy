@@ -1,8 +1,9 @@
 /**
- * Mitsubishi Comfort Cloud — wireless room sensor (PAC-USWHS003-TH-1) child driver.
+ * Mitsubishi Comfort Cloud — wireless room sensor (PAC-USWHS003-TH-1) component driver.
+ * Nested under the zone thermostat parent device.
  */
 metadata {
-    definition(name: "Mitsubishi Comfort Wireless Sensor", namespace: "ephrayim", author: "ephrayim", importUrl: "https://github.com/evdev/mitsubishi-comfort-hubitat") {
+    definition(name: "Mitsubishi Comfort Wireless Sensor", namespace: "ephrayim", author: "ephrayim", importUrl: "https://github.com/evdev/mitsubishi-comfort-hubitat", component: true) {
         capability "Refresh"
         capability "Sensor"
         capability "Temperature Measurement"
