@@ -149,6 +149,7 @@ def emitChildEvents(String type, List events) {
         log.warn "Missing ${type} component (dni=${componentDni(type)}, serial=${device.getDataValue('deviceSerial')}, children=${kids})"
         return
     }
+    logDebug "parse ${type} ${child.deviceNetworkId} events=${payload*.name}"
     try {
         getChildDevice(child.deviceNetworkId)?.parse(payload)
     } catch (Exception e) {
@@ -185,6 +186,8 @@ def coerceMap(value) {
 
 def publishComponents() {
     def data = (state.componentState instanceof Map) ? state.componentState : [:]
+    def kids = getChildDevices()?.collect { it.deviceNetworkId } ?: []
+    logDebug "publishComponents types=${data.keySet()} children=${kids}"
     if (data.indoor instanceof Map) emitChildEvents("indoor", indoorEvents(data.indoor))
     if (data.diag instanceof Map) emitChildEvents("diag", diagnosticEvents(data.diag))
     if (data.filter instanceof Map) emitChildEvents("filter", filterEvents(data.filter))
@@ -354,6 +357,7 @@ def setVanePosition(position) {
 
 def applyThermostatState(Map st) {
     if (!st) return
+    logDebug "applyThermostatState keys=${st.keySet()}"
 
     if (st.supportedModes != null) {
         sendEvent(name: "supportedThermostatModes", value: st.supportedModes)
@@ -419,7 +423,9 @@ def applyThermostatState(Map st) {
 
     def hadComponents = false
     ["indoor", "diag", "filter", "wireless"].each { type ->
-        def nested = coerceMap(st[type])
+        def nested = coerceMap(st[type]) ?:
+            coerceMap(st["${type}Json"]) ?:
+            coerceMap(getDataValue("comp_${type}_json"))
         if (nested) {
             queueComponentState(type, nested)
             hadComponents = true
@@ -442,5 +448,5 @@ def temperatureScaleUnit() {
 }
 
 def logDebug(msg) {
-    if (logEnable) log.debug msg
+    if (logEnable) log.info msg
 }

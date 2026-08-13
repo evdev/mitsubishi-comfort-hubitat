@@ -226,10 +226,21 @@ def initializeApp(Boolean fullInit) {
     unschedule()
     state.pollingScheduled = false
     ensureStateMaps()
-    ensureAllZoneChildren()
+    try {
+        ensureAllZoneChildren()
+        logDebug "Zone children ensured for ${(state.zoneIndex ?: [:]).size()} zone(s)"
+        (state.knownSerials ?: []).each { serial ->
+            if (state.deviceData[serial] instanceof Map) {
+                pushStateToChildren(serial as String)
+            }
+        }
+    } catch (Exception e) {
+        log.error "Failed to ensure/publish zone children: ${e.message}"
+    }
 
     if (settings.debugLogging) {
         runIn(1800, "debugOff", [overwrite: true])
+        log.info "Mitsubishi Comfort debug logging enabled"
     }
 
     if (!settings.username || !settings.password || !settings.siteId) {
@@ -397,6 +408,7 @@ def onAuthSuccess() {
     state.lastCloudContact = new Date().format("yyyy-MM-dd HH:mm:ss")
     def step = state.authNextStep
     state.authNextStep = null
+    logDebug "Auth success, nextStep=${step}"
 
     if (!state.pollingScheduled) {
         schedulePolling()
@@ -1132,14 +1144,8 @@ def pushThermostatState(String serial) {
         def standby = device.standby != null ? device.standby : display.standby
         if (defrost != null) stateMap.defrost = defrost
         if (standby != null) stateMap.standby = standby
-        def indoor = indoorStateMap(serial)
-        def diag = diagnosticStateMap(serial)
-        def filter = filterStateMap(serial)
-        def wireless = wirelessStateMap(serial)
-        if (indoor) stateMap.indoor = indoor
-        if (diag) stateMap.diag = diag
-        if (filter) stateMap.filter = filter
-        if (wireless) stateMap.wireless = wireless
+        attachComponentJson(stateMap, serial)
+        logDebug "applyThermostatState ${tailSerial(serial)} keys=${stateMap.keySet()}"
         child.applyThermostatState(stateMap)
     } catch (Exception e) {
         log.error "pushThermostatState failed for ${tailSerial(serial)}: ${e.message}"
@@ -1210,12 +1216,36 @@ def wirelessStateMap(String serial) {
     ]
 }
 
+def attachComponentJson(Map stateMap, String serial) {
+    def tstat = getThermostat(serial)
+    [
+        indoor: indoorStateMap(serial),
+        diag: diagnosticStateMap(serial),
+        filter: filterStateMap(serial),
+        wireless: wirelessStateMap(serial)
+    ].each { type, payload ->
+        if (!(payload instanceof Map)) return
+        def json = JsonOutput.toJson(payload)
+        stateMap["${type}Json"] = json
+        try {
+            tstat?.updateDataValue("comp_${type}_json", json)
+        } catch (Exception e) {
+            logDebug "updateDataValue comp_${type}_json failed: ${e.message}"
+        }
+    }
+}
+
 def pushComponentToThermostat(String serial, String key, Map payload) {
     def child = getThermostat(serial)
     if (!child || !(payload instanceof Map)) return
+    def json = JsonOutput.toJson(payload)
     def extra = [:]
-    extra[key] = payload
+    extra["${key}Json"] = json
     try {
+        child.updateDataValue("comp_${key}_json", json)
+    } catch (Exception ignored) {}
+    try {
+        logDebug "push ${key}Json for ${tailSerial(serial)}: ${json}"
         child.applyThermostatState(extra)
     } catch (Exception e) {
         log.error "push ${key} state failed: ${e.message}"
@@ -2373,5 +2403,5 @@ def buildCandidateIpList() {
 }
 
 def logDebug(msg) {
-    if (settings.debugLogging) log.debug msg
+    if (settings.debugLogging) log.info msg
 }

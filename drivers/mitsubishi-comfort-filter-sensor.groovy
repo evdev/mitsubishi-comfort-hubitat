@@ -42,6 +42,7 @@ void parse(String description) { log.warn "parse(String description) not impleme
 void parse(List description) {
     description?.each { ev ->
         if (ev instanceof Map && ev.name != null && ev.containsKey("value") && ev.value != null) {
+            if (logEnable) log.info "parse ${ev.name}=${ev.value}"
             sendEvent(ev)
         }
     }

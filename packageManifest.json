@@ -1,7 +1,7 @@
 {
   "packageName": "Mitsubishi Comfort Cloud",
   "author": "evdev",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "minimumHEVersion": "2.3.0",
   "dateReleased": "2026-08-13",
   "category": "Integrations",
@@ -10,7 +10,7 @@
   "documentationLink": "https://github.com/evdev/mitsubishi-comfort-hubitat#readme",
   "communityLink": "https://github.com/evdev/mitsubishi-comfort-hubitat/issues",
   "gitHubUrl": "https://github.com/evdev/mitsubishi-comfort-hubitat",
-  "releaseNotes": "2026-08-13: 1.2.2 - Route nested component updates through applyThermostatState with queued publish and child parse() handlers.\n2026-08-13: 1.2.1 - Fix nested component updates by sending events directly to child devices and improving component lookup.\n2026-08-13: 1.2.0 - Nest indoor, filter, diagnostics, and wireless sensors under each zone thermostat. Upgrading recreates those satellite devices (thermostat IDs are unchanged).\n2026-08-13: 1.1.2 - Indoor humidity from zone/MHK2/cloud, shared cloudStatus, live filterDirty on the Filter child, and defrost/standby on the thermostat.\n2026-08-13: 1.1.1 - Hubitat button actions for local credential/IP refresh, improved command retry on auth/local failures, and Kumo local auth token fixes for Hubitat runtime.\n2026-07-27: 1.1.0 - Hybrid local LAN control (pykumo protocol), offline local-only mode, per-zone IP settings, connectionPath attribute.\n2026-07-26: 1.0.1 - Profile-driven fan modes and setpoint limits.\n2026-07-26: 1.0.0 - Initial release.",
+  "releaseNotes": "2026-08-13: 1.2.3 - Pass nested component state as JSON via data values and applyThermostatState; republish cached state on app init; improve debug logging visibility.\n2026-08-13: 1.2.2 - Route nested component updates through applyThermostatState with queued publish and child parse() handlers.\n2026-08-13: 1.2.1 - Fix nested component updates by sending events directly to child devices and improving component lookup.\n2026-08-13: 1.2.0 - Nest indoor, filter, diagnostics, and wireless sensors under each zone thermostat. Upgrading recreates those satellite devices (thermostat IDs are unchanged).\n2026-08-13: 1.1.2 - Indoor humidity from zone/MHK2/cloud, shared cloudStatus, live filterDirty on the Filter child, and defrost/standby on the thermostat.\n2026-08-13: 1.1.1 - Hubitat button actions for local credential/IP refresh, improved command retry on auth/local failures, and Kumo local auth token fixes for Hubitat runtime.\n2026-07-27: 1.1.0 - Hybrid local LAN control (pykumo protocol), offline local-only mode, per-zone IP settings, connectionPath attribute.\n2026-07-26: 1.0.1 - Profile-driven fan modes and setpoint limits.\n2026-07-26: 1.0.0 - Initial release.",
   "apps": [
     {
       "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
