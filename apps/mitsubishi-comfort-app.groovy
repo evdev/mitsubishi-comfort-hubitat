@@ -1048,7 +1048,7 @@ def pushCloudStatus(String serial, String cloudStatus) {
     def tstat = getThermostat(serial)
     if (!tstat) return
     try {
-        tstat.pushCloudStatus(cloudStatus)
+        tstat.applyThermostatState([componentCloudStatus: cloudStatus])
     } catch (Exception e) {
         tstat.sendEvent(name: "cloudStatus", value: cloudStatus)
         log.error "pushCloudStatus failed for ${tailSerial(serial)}: ${e.message}"
@@ -1132,17 +1132,23 @@ def pushThermostatState(String serial) {
         def standby = device.standby != null ? device.standby : display.standby
         if (defrost != null) stateMap.defrost = defrost
         if (standby != null) stateMap.standby = standby
+        def indoor = indoorStateMap(serial)
+        def diag = diagnosticStateMap(serial)
+        def filter = filterStateMap(serial)
+        def wireless = wirelessStateMap(serial)
+        if (indoor) stateMap.indoor = indoor
+        if (diag) stateMap.diag = diag
+        if (filter) stateMap.filter = filter
+        if (wireless) stateMap.wireless = wireless
         child.applyThermostatState(stateMap)
     } catch (Exception e) {
         log.error "pushThermostatState failed for ${tailSerial(serial)}: ${e.message}"
     }
 }
 
-def pushIndoorState(String serial) {
-    def child = getThermostat(serial)
-    if (!child) return
+def indoorStateMap(String serial) {
     def device = state.deviceData[serial]
-    if (!(device instanceof Map)) return
+    if (!(device instanceof Map)) return null
     def humidity = device.humidity != null ? device.humidity : state.zoneIndex[serial]?.humidity
     def map = [
         temperature: cToDisplay(device.roomTemp),
@@ -1152,66 +1158,28 @@ def pushIndoorState(String serial) {
     if (humidity != null) map.humidity = roundHumidity(humidity)
     if (device.tempSource != null) map.tempSource = device.tempSource.toString()
     if (device.activeThermistor != null) map.activeThermistor = device.activeThermistor.toString()
-    try {
-        child.forwardIndoorState(map)
-    } catch (Exception e) {
-        log.error "pushIndoorState failed: ${e.message}"
-    }
+    return map
 }
 
-def pushWirelessState(String serial) {
-    def child = getThermostat(serial)
-    if (!child) return
-    def sensor = state.wirelessData[serial]
-    if (!(sensor instanceof Map)) return
-    def tempC = sensor.temperature
-    def temp = null
-    if (tempC != null) {
-        temp = useFahrenheit() ?
-            Math.round((((tempC as double) * 9.0 / 5.0) + 32.0) * 10.0) / 10.0 :
-            Math.round((tempC as double) * 10.0) / 10.0
-    }
-    try {
-        child.forwardWirelessState([
-            temperature: temp,
-            tempUnit: useFahrenheit() ? "°F" : "°C",
-            humidity: roundHumidity(sensor.humidity),
-            battery: sensor.battery,
-            rssi: sensor.rssi,
-            cloudStatus: resolveCloudStatus(serial)
-        ])
-    } catch (Exception e) {
-        log.error "pushWirelessState failed: ${e.message}"
-    }
-}
-
-def pushDiagnosticState(String serial) {
-    def child = getThermostat(serial)
-    if (!child) return
+def diagnosticStateMap(String serial) {
     def status = state.statusData[serial]
-    if (!(status instanceof Map)) return
-    try {
-        child.forwardDiagnosticState([
-            rssi: status.routerRssi,
-            firmwareVersion: status.firmwareVersion,
-            routerSsid: status.routerSsid,
-            cloudStatus: resolveCloudStatus(serial)
-        ])
-    } catch (Exception e) {
-        log.error "pushDiagnosticState failed: ${e.message}"
-    }
+    if (!(status instanceof Map)) return null
+    return [
+        rssi: status.routerRssi,
+        firmwareVersion: status.firmwareVersion,
+        routerSsid: status.routerSsid,
+        cloudStatus: resolveCloudStatus(serial)
+    ]
 }
 
-def pushFilterState(String serial) {
+def filterStateMap(String serial) {
     def zoneId = state.zoneIndex[serial]?.zoneId
-    if (!zoneId) return
-    def child = getThermostat(serial)
-    if (!child) return
+    if (!zoneId) return null
     def notifications = state.notificationData[zoneId]
     def device = state.deviceData[serial]
     def display = (device instanceof Map && device.displayConfig instanceof Map) ? device.displayConfig : [:]
     def filterDirty = (device instanceof Map && device.filterDirty != null) ? device.filterDirty : display.filter
-    if (!(notifications instanceof Map) && filterDirty == null) return
+    if (!(notifications instanceof Map) && filterDirty == null) return null
     def map = [cloudStatus: resolveCloudStatus(serial)]
     if (filterDirty != null) map.filterDirty = filterDirty
     if (notifications instanceof Map) {
@@ -1219,11 +1187,59 @@ def pushFilterState(String serial) {
         map.reminderIntervalDays = notifications.filterDirtyReminderInterval
         map.remindersEnabled = notifications.filterDirty != null ? notifications.filterDirty.toString() : null
     }
-    try {
-        child.forwardFilterState(map)
-    } catch (Exception e) {
-        log.error "pushFilterState failed: ${e.message}"
+    return map
+}
+
+def wirelessStateMap(String serial) {
+    def sensor = state.wirelessData[serial]
+    if (!(sensor instanceof Map)) return null
+    def tempC = sensor.temperature
+    def temp = null
+    if (tempC != null) {
+        temp = useFahrenheit() ?
+            Math.round((((tempC as double) * 9.0 / 5.0) + 32.0) * 10.0) / 10.0 :
+            Math.round((tempC as double) * 10.0) / 10.0
     }
+    return [
+        temperature: temp,
+        tempUnit: useFahrenheit() ? "°F" : "°C",
+        humidity: roundHumidity(sensor.humidity),
+        battery: sensor.battery,
+        rssi: sensor.rssi,
+        cloudStatus: resolveCloudStatus(serial)
+    ]
+}
+
+def pushComponentToThermostat(String serial, String key, Map payload) {
+    def child = getThermostat(serial)
+    if (!child || !(payload instanceof Map)) return
+    def extra = [:]
+    extra[key] = payload
+    try {
+        child.applyThermostatState(extra)
+    } catch (Exception e) {
+        log.error "push ${key} state failed: ${e.message}"
+    }
+}
+
+def pushIndoorState(String serial) {
+    def map = indoorStateMap(serial)
+    if (map) pushComponentToThermostat(serial, "indoor", map)
+}
+
+def pushWirelessState(String serial) {
+    def map = wirelessStateMap(serial)
+    if (map) pushComponentToThermostat(serial, "wireless", map)
+}
+
+def pushDiagnosticState(String serial) {
+    def map = diagnosticStateMap(serial)
+    if (map) pushComponentToThermostat(serial, "diag", map)
+}
+
+def pushFilterState(String serial) {
+    def map = filterStateMap(serial)
+    if (map) pushComponentToThermostat(serial, "filter", map)
 }
 
 def normalizeProfile(profile) {

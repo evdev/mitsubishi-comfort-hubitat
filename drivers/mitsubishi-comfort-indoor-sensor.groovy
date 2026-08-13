@@ -42,8 +42,10 @@ def refresh() {
     parent?.componentRefresh(device)
 }
 
-void parse(List<Map> events) {
-    events?.each { ev ->
+void parse(String description) { log.warn "parse(String description) not implemented" }
+
+void parse(List description) {
+    description?.each { ev ->
         if (ev instanceof Map && ev.name != null && ev.containsKey("value") && ev.value != null) {
             sendEvent(ev)
         }

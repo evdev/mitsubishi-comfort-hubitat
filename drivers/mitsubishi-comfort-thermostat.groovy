@@ -141,70 +141,129 @@ def componentByType(String type) {
 }
 
 def emitChildEvents(String type, List events) {
+    def payload = events?.findAll { it instanceof Map && it.name != null && it.containsKey("value") && it.value != null } ?: []
+    if (payload.isEmpty()) return
     def child = componentByType(type)
     if (!child) {
         def kids = getChildDevices()?.collect { it.deviceNetworkId } ?: []
         log.warn "Missing ${type} component (dni=${componentDni(type)}, serial=${device.getDataValue('deviceSerial')}, children=${kids})"
         return
     }
-    events?.each { ev ->
-        if (ev instanceof Map && ev.name != null && ev.containsKey("value") && ev.value != null) {
-            child.sendEvent(ev)
+    try {
+        getChildDevice(child.deviceNetworkId)?.parse(payload)
+    } catch (Exception e) {
+        log.warn "parse failed for ${type}: ${e.message}"
+        payload.each { ev ->
+            child.sendEvent(name: ev.name, value: ev.value, unit: ev.unit, descriptionText: ev.descriptionText)
         }
     }
 }
 
-def forwardIndoorState(st) {
-    if (!(st instanceof Map)) return
+def queueComponentState(String type, st) {
+    def incoming = coerceMap(st)
+    if (!incoming) return
+    def cs = (state.componentState instanceof Map) ? [:] + state.componentState : [:]
+    def prev = (cs[type] instanceof Map) ? [:] + cs[type] : [:]
+    prev.putAll(incoming)
+    cs[type] = prev
+    state.componentState = cs
+}
+
+def coerceMap(value) {
+    if (value instanceof Map) return value
+    if (value instanceof String) {
+        def trimmed = value.trim()
+        if (trimmed.startsWith("{")) {
+            try {
+                def parsed = new groovy.json.JsonSlurper().parseText(trimmed)
+                return (parsed instanceof Map) ? parsed : null
+            } catch (ignored) {}
+        }
+    }
+    return null
+}
+
+def publishComponents() {
+    def data = (state.componentState instanceof Map) ? state.componentState : [:]
+    if (data.indoor instanceof Map) emitChildEvents("indoor", indoorEvents(data.indoor))
+    if (data.diag instanceof Map) emitChildEvents("diag", diagnosticEvents(data.diag))
+    if (data.filter instanceof Map) emitChildEvents("filter", filterEvents(data.filter))
+    if (data.wireless instanceof Map) emitChildEvents("wireless", wirelessEvents(data.wireless))
+}
+
+def indoorEvents(Map st) {
     def unit = (st.tempUnit ?: temperatureScaleUnit()) as String
     def events = []
-    if (st.temperature != null) events << [name: "temperature", value: st.temperature, unit: unit]
-    if (st.humidity != null) events << [name: "humidity", value: st.humidity, unit: "%"]
-    if (st.cloudStatus != null) events << [name: "cloudStatus", value: st.cloudStatus]
-    if (st.tempSource != null) events << [name: "tempSource", value: st.tempSource.toString()]
-    if (st.activeThermistor != null) events << [name: "activeThermistor", value: st.activeThermistor.toString()]
-    emitChildEvents("indoor", events)
+    if (st.temperature != null) events << [name: "temperature", value: st.temperature, unit: unit, descriptionText: "temperature is ${st.temperature}${unit}"]
+    if (st.humidity != null) events << [name: "humidity", value: st.humidity, unit: "%", descriptionText: "humidity is ${st.humidity}%"]
+    if (st.cloudStatus != null) events << [name: "cloudStatus", value: st.cloudStatus, descriptionText: "cloudStatus is ${st.cloudStatus}"]
+    if (st.tempSource != null) events << [name: "tempSource", value: st.tempSource.toString(), descriptionText: "tempSource is ${st.tempSource}"]
+    if (st.activeThermistor != null) events << [name: "activeThermistor", value: st.activeThermistor.toString(), descriptionText: "activeThermistor is ${st.activeThermistor}"]
+    return events
+}
+
+def diagnosticEvents(Map st) {
+    def events = []
+    if (st.rssi != null) events << [name: "rssi", value: st.rssi, descriptionText: "rssi is ${st.rssi}"]
+    if (st.firmwareVersion != null) events << [name: "firmwareVersion", value: st.firmwareVersion.toString(), descriptionText: "firmwareVersion is ${st.firmwareVersion}"]
+    if (st.routerSsid != null) events << [name: "routerSsid", value: st.routerSsid.toString(), descriptionText: "routerSsid is ${st.routerSsid}"]
+    if (st.cloudStatus != null) events << [name: "cloudStatus", value: st.cloudStatus, descriptionText: "cloudStatus is ${st.cloudStatus}"]
+    return events
+}
+
+def filterEvents(Map st) {
+    def events = []
+    if (st.filterDirty != null) events << [name: "filterDirty", value: st.filterDirty.toString(), descriptionText: "filterDirty is ${st.filterDirty}"]
+    if (st.lastFilterReminder != null) events << [name: "lastFilterReminder", value: st.lastFilterReminder.toString(), descriptionText: "lastFilterReminder is ${st.lastFilterReminder}"]
+    if (st.reminderIntervalDays != null) events << [name: "reminderIntervalDays", value: st.reminderIntervalDays as BigDecimal, descriptionText: "reminderIntervalDays is ${st.reminderIntervalDays}"]
+    if (st.remindersEnabled != null) events << [name: "remindersEnabled", value: st.remindersEnabled.toString(), descriptionText: "remindersEnabled is ${st.remindersEnabled}"]
+    if (st.cloudStatus != null) events << [name: "cloudStatus", value: st.cloudStatus, descriptionText: "cloudStatus is ${st.cloudStatus}"]
+    return events
+}
+
+def wirelessEvents(Map st) {
+    def unit = (st.tempUnit ?: temperatureScaleUnit()) as String
+    def events = []
+    if (st.temperature != null) events << [name: "temperature", value: st.temperature, unit: unit, descriptionText: "temperature is ${st.temperature}${unit}"]
+    if (st.humidity != null) events << [name: "humidity", value: st.humidity, unit: "%", descriptionText: "humidity is ${st.humidity}%"]
+    if (st.battery != null) events << [name: "battery", value: st.battery, unit: "%", descriptionText: "battery is ${st.battery}%"]
+    if (st.rssi != null) events << [name: "rssi", value: st.rssi, descriptionText: "rssi is ${st.rssi}"]
+    if (st.cloudStatus != null) events << [name: "cloudStatus", value: st.cloudStatus, descriptionText: "cloudStatus is ${st.cloudStatus}"]
+    return events
+}
+
+def scheduleComponentPublish() {
+    publishComponents()
+    runIn(1, "publishComponents", [overwrite: true])
+}
+
+def forwardIndoorState(st) {
+    queueComponentState("indoor", st)
+    scheduleComponentPublish()
 }
 
 def forwardDiagnosticState(st) {
-    if (!(st instanceof Map)) return
-    def events = []
-    if (st.rssi != null) events << [name: "rssi", value: st.rssi]
-    if (st.firmwareVersion != null) events << [name: "firmwareVersion", value: st.firmwareVersion.toString()]
-    if (st.routerSsid != null) events << [name: "routerSsid", value: st.routerSsid.toString()]
-    if (st.cloudStatus != null) events << [name: "cloudStatus", value: st.cloudStatus]
-    emitChildEvents("diag", events)
+    queueComponentState("diag", st)
+    scheduleComponentPublish()
 }
 
 def forwardFilterState(st) {
-    if (!(st instanceof Map)) return
-    def events = []
-    if (st.filterDirty != null) events << [name: "filterDirty", value: st.filterDirty.toString()]
-    if (st.lastFilterReminder != null) events << [name: "lastFilterReminder", value: st.lastFilterReminder.toString()]
-    if (st.reminderIntervalDays != null) events << [name: "reminderIntervalDays", value: st.reminderIntervalDays as BigDecimal]
-    if (st.remindersEnabled != null) events << [name: "remindersEnabled", value: st.remindersEnabled.toString()]
-    if (st.cloudStatus != null) events << [name: "cloudStatus", value: st.cloudStatus]
-    emitChildEvents("filter", events)
+    queueComponentState("filter", st)
+    scheduleComponentPublish()
 }
 
 def forwardWirelessState(st) {
-    if (!(st instanceof Map)) return
-    def unit = (st.tempUnit ?: temperatureScaleUnit()) as String
-    def events = []
-    if (st.temperature != null) events << [name: "temperature", value: st.temperature, unit: unit]
-    if (st.humidity != null) events << [name: "humidity", value: st.humidity, unit: "%"]
-    if (st.battery != null) events << [name: "battery", value: st.battery, unit: "%"]
-    if (st.rssi != null) events << [name: "rssi", value: st.rssi]
-    if (st.cloudStatus != null) events << [name: "cloudStatus", value: st.cloudStatus]
-    emitChildEvents("wireless", events)
+    queueComponentState("wireless", st)
+    scheduleComponentPublish()
 }
 
 def pushCloudStatus(String cloudStatus) {
     if (!cloudStatus) return
     sendEvent(name: "cloudStatus", value: cloudStatus)
-    getChildDevices()?.each { child ->
-        child.sendEvent(name: "cloudStatus", value: cloudStatus)
+    ["indoor", "diag", "filter", "wireless"].each { type ->
+        queueComponentState(type, [cloudStatus: cloudStatus])
     }
+    scheduleComponentPublish()
 }
 
 // --- Thermostat capability commands ---
@@ -356,6 +415,25 @@ def applyThermostatState(Map st) {
         if (st[attr] != null) {
             sendEvent(name: attr, value: st[attr], unit: unit)
         }
+    }
+
+    def hadComponents = false
+    ["indoor", "diag", "filter", "wireless"].each { type ->
+        def nested = coerceMap(st[type])
+        if (nested) {
+            queueComponentState(type, nested)
+            hadComponents = true
+        }
+    }
+    if (st.componentCloudStatus != null) {
+        sendEvent(name: "cloudStatus", value: st.componentCloudStatus)
+        ["indoor", "diag", "filter", "wireless"].each { type ->
+            queueComponentState(type, [cloudStatus: st.componentCloudStatus])
+        }
+        hadComponents = true
+    }
+    if (hadComponents) {
+        scheduleComponentPublish()
     }
 }
 
