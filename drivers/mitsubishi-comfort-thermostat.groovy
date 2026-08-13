@@ -108,47 +108,95 @@ def ensureComponent(String dni, String driverName, String label, Map dataValues)
     dataValues.each { k, v ->
         if (v != null) child.updateDataValue(k as String, v.toString())
     }
+    if (dataValues.deviceType) {
+        updateDataValue("dni_${dataValues.deviceType}", dni)
+    }
     return child
 }
 
-def componentByType(String type) {
+def componentDni(String type) {
     def serial = device.getDataValue("deviceSerial")
     def zoneId = device.getDataValue("zoneId")
     if (!serial) return null
-    def dni
     switch (type) {
-        case "indoor":
-            dni = "mc-${serial}-indoor"
-            break
-        case "diag":
-            dni = "mc-${serial}-diag"
-            break
-        case "filter":
-            dni = zoneId ? "mc-${zoneId}-filter" : null
-            break
-        case "wireless":
-            dni = "mc-${serial}-wireless"
-            break
-        default:
-            return null
+        case "indoor": return "mc-${serial}-indoor"
+        case "diag": return "mc-${serial}-diag"
+        case "filter": return zoneId ? "mc-${zoneId}-filter" : null
+        case "wireless": return "mc-${serial}-wireless"
+        default: return null
     }
-    return dni ? getChildDevice(dni) : null
 }
 
-def forwardIndoorState(Map st) {
-    componentByType("indoor")?.applyIndoorState(st)
+def componentByType(String type) {
+    def dni = device.getDataValue("dni_${type}") ?: componentDni(type)
+    def kids = getChildDevices() ?: []
+    def child = dni ? kids.find { (it.deviceNetworkId as String) == dni } : null
+    if (!child && dni) {
+        try { child = getChildDevice(dni) } catch (ignored) {}
+    }
+    if (!child) {
+        child = kids.find { it.getDataValue("deviceType") == type }
+    }
+    return child
 }
 
-def forwardDiagnosticState(Map st) {
-    componentByType("diag")?.applyDiagnosticState(st)
+def emitChildEvents(String type, List events) {
+    def child = componentByType(type)
+    if (!child) {
+        def kids = getChildDevices()?.collect { it.deviceNetworkId } ?: []
+        log.warn "Missing ${type} component (dni=${componentDni(type)}, serial=${device.getDataValue('deviceSerial')}, children=${kids})"
+        return
+    }
+    events?.each { ev ->
+        if (ev instanceof Map && ev.name != null && ev.containsKey("value") && ev.value != null) {
+            child.sendEvent(ev)
+        }
+    }
 }
 
-def forwardFilterState(Map st) {
-    componentByType("filter")?.applyFilterState(st)
+def forwardIndoorState(st) {
+    if (!(st instanceof Map)) return
+    def unit = (st.tempUnit ?: temperatureScaleUnit()) as String
+    def events = []
+    if (st.temperature != null) events << [name: "temperature", value: st.temperature, unit: unit]
+    if (st.humidity != null) events << [name: "humidity", value: st.humidity, unit: "%"]
+    if (st.cloudStatus != null) events << [name: "cloudStatus", value: st.cloudStatus]
+    if (st.tempSource != null) events << [name: "tempSource", value: st.tempSource.toString()]
+    if (st.activeThermistor != null) events << [name: "activeThermistor", value: st.activeThermistor.toString()]
+    emitChildEvents("indoor", events)
 }
 
-def forwardWirelessState(Map st) {
-    componentByType("wireless")?.applyWirelessState(st)
+def forwardDiagnosticState(st) {
+    if (!(st instanceof Map)) return
+    def events = []
+    if (st.rssi != null) events << [name: "rssi", value: st.rssi]
+    if (st.firmwareVersion != null) events << [name: "firmwareVersion", value: st.firmwareVersion.toString()]
+    if (st.routerSsid != null) events << [name: "routerSsid", value: st.routerSsid.toString()]
+    if (st.cloudStatus != null) events << [name: "cloudStatus", value: st.cloudStatus]
+    emitChildEvents("diag", events)
+}
+
+def forwardFilterState(st) {
+    if (!(st instanceof Map)) return
+    def events = []
+    if (st.filterDirty != null) events << [name: "filterDirty", value: st.filterDirty.toString()]
+    if (st.lastFilterReminder != null) events << [name: "lastFilterReminder", value: st.lastFilterReminder.toString()]
+    if (st.reminderIntervalDays != null) events << [name: "reminderIntervalDays", value: st.reminderIntervalDays as BigDecimal]
+    if (st.remindersEnabled != null) events << [name: "remindersEnabled", value: st.remindersEnabled.toString()]
+    if (st.cloudStatus != null) events << [name: "cloudStatus", value: st.cloudStatus]
+    emitChildEvents("filter", events)
+}
+
+def forwardWirelessState(st) {
+    if (!(st instanceof Map)) return
+    def unit = (st.tempUnit ?: temperatureScaleUnit()) as String
+    def events = []
+    if (st.temperature != null) events << [name: "temperature", value: st.temperature, unit: unit]
+    if (st.humidity != null) events << [name: "humidity", value: st.humidity, unit: "%"]
+    if (st.battery != null) events << [name: "battery", value: st.battery, unit: "%"]
+    if (st.rssi != null) events << [name: "rssi", value: st.rssi]
+    if (st.cloudStatus != null) events << [name: "cloudStatus", value: st.cloudStatus]
+    emitChildEvents("wireless", events)
 }
 
 def pushCloudStatus(String cloudStatus) {

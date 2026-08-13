@@ -37,6 +37,14 @@ def refresh() {
     parent?.componentRefresh(device)
 }
 
+void parse(List<Map> events) {
+    events?.each { ev ->
+        if (ev instanceof Map && ev.name != null && ev.containsKey("value") && ev.value != null) {
+            sendEvent(ev)
+        }
+    }
+}
+
 def applyFilterState(Map st) {
     if (!st) return
     if (st.filterDirty != null) {
