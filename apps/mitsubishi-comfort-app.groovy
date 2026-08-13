@@ -20,6 +20,7 @@ definition(
     author: "ephrayim",
     description: "Mitsubishi Comfort / Kumo Cloud HVAC with hybrid local LAN control",
     category: "Integrations",
+    menu: "Integrations",
     iconUrl: "",
     iconX2Url: "",
     importUrl: "https://github.com/evdev/mitsubishi-comfort-hubitat"
@@ -109,13 +110,6 @@ def mainPage() {
     }
     state.lastCredKey = credKey
 
-    if (params?.action == "refreshCreds" && tokenIsFresh()) {
-        startSocketIoPasswordFetch()
-    }
-    if (params?.action == "rediscoverIp") {
-        startIpDiscovery()
-    }
-
     if (settings.username && settings.password && !state.setupSitesLoaded) {
         loadSetupSites()
     }
@@ -169,8 +163,8 @@ def mainPage() {
                     input name: ipKey, type: "text", title: title, required: false
                 }
             }
-            href name: "mainPage", title: "Refresh local credentials", description: "Re-fetch passwords from cloud", params: [action: "refreshCreds"]
-            href name: "mainPage", title: "Re-discover local IPs", description: "Probe subnet for units", params: [action: "rediscoverIp"]
+            input name: "btnRefreshCreds", type: "button", title: "Refresh local credentials"
+            input name: "btnRediscoverIp", type: "button", title: "Re-discover local IPs"
         }
         section("Diagnostics") {
             input name: "debugLogging", type: "bool", title: "Debug logging (auto-off after 30 min)", defaultValue: false
@@ -192,6 +186,21 @@ def cleanupPage() {
                 }
             }
         }
+    }
+}
+
+def appButtonHandler(btn) {
+    switch (btn) {
+        case "btnRefreshCreds":
+            if (tokenIsFresh()) {
+                startSocketIoPasswordFetch()
+            } else {
+                log.warn "Cannot refresh local credentials: cloud token is not fresh"
+            }
+            break
+        case "btnRediscoverIp":
+            startIpDiscovery()
+            break
     }
 }
 
