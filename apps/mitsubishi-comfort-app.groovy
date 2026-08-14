@@ -40,6 +40,7 @@ definition(
 @Field static final Long OFFLINE_PROBE_MS = 10L * 60L * 1000L
 @Field static final Integer LOCAL_HTTP_TIMEOUT = 8
 @Field static final Integer CRYPTO_SERIAL_MIN_BYTES = 9
+@Field static final Integer LOCAL_SENSOR_INDEX_MAX = 3
 @Field static final String LOCAL_STATUS_QUERY = '{"c":{"indoorUnit":{"status":{}}}}'
 @Field static final String LOCAL_PROFILE_QUERY = '{"c":{"indoorUnit":{"profile":{}}}}'
 @Field static final String LOCAL_ADAPTER_STATUS_QUERY = '{"c":{"adapter":{"status":{}}}}'
@@ -194,7 +195,7 @@ def appButtonHandler(btn) {
     switch (btn) {
         case "btnRefreshCreds":
             if (tokenIsFresh()) {
-                startSocketIoPasswordFetch()
+                startSocketIoPasswordFetch(true)
             } else {
                 log.warn "Cannot refresh local credentials: cloud token is not fresh"
             }
@@ -251,18 +252,29 @@ def initializeApp(Boolean fullInit) {
     syncManualIpSettings()
     recomputeOfflineReady()
 
-    if (fullInit && state.setupAccessToken) {
+    def credKey = "${settings.username ?: ''}:${settings.password ? 'set' : ''}"
+    def credsChanged = state.appliedCredKey && state.appliedCredKey != credKey
+    if (credsChanged) {
+        clearRuntimeAuth()
+    }
+    if (state.setupAccessToken) {
         atomicState.accessToken = state.setupAccessToken
         atomicState.refreshToken = state.setupRefreshToken
-        atomicState.tokenExpiresAt = now() + TOKEN_TTL_MS
+        def issuedAt = (state.setupTokenIssuedAt ?: now()) as long
+        atomicState.tokenExpiresAt = issuedAt + TOKEN_TTL_MS
         state.remove("setupAccessToken")
         state.remove("setupRefreshToken")
+        state.remove("setupTokenIssuedAt")
+        state.appliedCredKey = credKey
+    } else if (!state.appliedCredKey || credsChanged) {
+        state.appliedCredKey = credKey
     }
 
-    if (!tokenIsFresh() && offlineOperationAllowed()) {
+    if (!tokenIsFresh() && !credsChanged && offlineOperationAllowed()) {
         state.cloudOffline = true
         onOfflineBoot(fullInit ? "initialDiscover" : "resume")
-        return
+        // Fully local-ready: stay offline. Partial: still try cloud for the rest.
+        if (state.offlineReady) return
     }
 
     runtimeLogin(fullInit ? "initialDiscover" : "resume")
@@ -271,6 +283,14 @@ def initializeApp(Boolean fullInit) {
 def debugOff() {
     app.updateSetting("debugLogging", [type: "bool", value: false])
     log.info "Mitsubishi Comfort debug logging disabled"
+}
+
+def clearRuntimeAuth() {
+    atomicState.accessToken = null
+    atomicState.refreshToken = null
+    atomicState.tokenExpiresAt = null
+    atomicState.refreshInProgress = false
+    state.pendingHttpQueue = []
 }
 
 def ensureStateMaps() {
@@ -328,6 +348,7 @@ def loadSetupSites() {
         }
         state.setupAccessToken = loginJson.token.access
         state.setupRefreshToken = loginJson.token.refresh
+        state.setupTokenIssuedAt = now()
 
         def sitesResp = null
         httpGet([
@@ -367,7 +388,7 @@ def loadSetupSites() {
 
 def runtimeLogin(String nextStep) {
     state.authNextStep = nextStep
-    if (state.cloudOffline && offlineOperationAllowed()) {
+    if (state.cloudOffline && state.offlineReady && offlineOperationAllowed()) {
         onOfflineBoot(nextStep)
         return
     }
@@ -383,7 +404,7 @@ def runtimeLogin(String nextStep) {
 }
 
 def onOfflineBoot(String nextStep) {
-    log.warn "Mitsubishi Comfort: cloud offline — using local-only mode"
+    log.warn "Mitsubishi Comfort: cloud offline — using local control where credentials are complete"
     if (!state.pollingScheduled) {
         schedulePolling()
         state.pollingScheduled = true
@@ -720,20 +741,30 @@ def dailyCredentialRefresh() {
 def pollDevices() {
     if (state.cloudOffline) {
         refreshAllDeviceDetailsLocal()
+        (state.knownSerials ?: []).each { serial ->
+            if (!canUseLocal(serial as String)) {
+                refreshDeviceDetail(serial as String)
+            }
+        }
         return
     }
     refreshAllDeviceDetails()
 }
 
 def pollZones() {
-    if (state.cloudOffline) return
+    if (state.cloudOffline && state.offlineReady) return
     discoverZones()
 }
 
 def pollStatusAll() {
     if (state.cloudOffline) {
         (state.knownSerials ?: []).each { serial ->
-            localPollAdapter(serial as String)
+            def s = serial as String
+            if (canUseLocal(s)) {
+                localPollAdapter(s)
+            } else {
+                apiGet("/devices/${s}/status", [requestType: "status", serial: s])
+            }
         }
         return
     }
@@ -743,7 +774,7 @@ def pollStatusAll() {
 }
 
 def pollNotificationsAll() {
-    if (state.cloudOffline) return
+    if (state.cloudOffline && state.offlineReady) return
     (state.zoneIndex ?: [:]).each { serial, info ->
         if (info?.zoneId) {
             apiGet("/zones/${info.zoneId}/notification-preferences", [
@@ -756,7 +787,12 @@ def pollNotificationsAll() {
 def pollProfilesAll() {
     if (state.cloudOffline) {
         (state.knownSerials ?: []).each { serial ->
-            localPollProfile(serial as String)
+            def s = serial as String
+            if (canUseLocal(s)) {
+                localPollProfile(s)
+            } else {
+                apiGet("/devices/${s}/profile", [requestType: "profile", serial: s])
+            }
         }
         return
     }
@@ -906,6 +942,9 @@ def ensureZoneChildren(String serial, String zoneId, String zoneName, Boolean ha
             zoneName: zoneName,
             hasSensor: hasSensor
         ])
+        if (!hasSensor && state.wirelessData instanceof Map) {
+            state.wirelessData.remove(serial)
+        }
     } catch (Exception e) {
         log.error "Failed to ensure components for ${tailSerial(serial)}: ${e.message}"
     }
@@ -1285,11 +1324,11 @@ def buildSupportedModes(profile) {
     def modes = ["off"]
     def p = normalizeProfile(profile)
     if (!p) return modes + ["heat", "cool", "auto"]
-    if (p.hasModeHeat || p.maximumSetPoints?.heat != null) modes << "heat"
+    if (p.hasModeHeat != false && (p.hasModeHeat || p.maximumSetPoints?.heat != null)) modes << "heat"
     if (p.hasModeCool || p.maximumSetPoints?.cool != null) modes << "cool"
     if (p.hasModeDry) modes << "dry"
     if (p.hasModeFan || p.hasModeVent) modes << "fan"
-    if (p.hasModeAuto || p.maximumSetPoints?.auto != null) modes << "auto"
+    if (p.hasModeAuto != false && (p.hasModeAuto || p.maximumSetPoints?.auto != null)) modes << "auto"
     return modes
 }
 
@@ -1342,17 +1381,27 @@ def mapKumoMode(device) {
 
 def computeOperatingState(String hubMode, room, heatSp, coolSp, device) {
     if (hubMode == "off") return "idle"
-    if (hubMode == "heat") return "heating"
-    if (hubMode == "cool") return "cooling"
-    if (hubMode == "dry") return "cooling"
     if (hubMode == "fan") return "fan only"
-    if (hubMode != "auto") return "idle"
+    if (room == null) {
+        if (hubMode == "heat") return "heating"
+        if (hubMode == "cool" || hubMode == "dry") return "cooling"
+        return "idle"
+    }
 
     def deadBand = useFahrenheit() ? 1.0d : 0.5d
-    def op = device?.operationMode
-    if (room == null) return "idle"
-
     def roomN = room as double
+    def op = device?.operationMode
+
+    if (hubMode == "heat") {
+        if (heatSp != null && roomN < ((heatSp as double) - deadBand)) return "heating"
+        return heatSp != null ? "idle" : "heating"
+    }
+    if (hubMode == "cool" || hubMode == "dry") {
+        if (coolSp != null && roomN > ((coolSp as double) + deadBand)) return "cooling"
+        return coolSp != null ? "idle" : "cooling"
+    }
+    if (hubMode != "auto") return "idle"
+
     if (op == "autoCool" && coolSp != null && roomN > ((coolSp as double) + deadBand)) return "cooling"
     if (op == "autoHeat" && heatSp != null && roomN < ((heatSp as double) - deadBand)) return "heating"
     if (coolSp != null && roomN > ((coolSp as double) + deadBand)) return "cooling"
@@ -1374,9 +1423,9 @@ def cToDisplay(celsius) {
     if (celsius == null) return null
     def c = roundHalf(celsius)
     if (!useFahrenheit()) return c
-    if (C_TO_F.containsKey(c)) return C_TO_F[c]
-    def cDouble = (c as BigDecimal).doubleValue()
-    if (C_TO_F.containsKey(cDouble)) return C_TO_F[cDouble]
+    // Map literals store 21.5 as BigDecimal; roundHalf() returns Double. Lookup must use BigDecimal.
+    def mapped = C_TO_F[c as BigDecimal]
+    if (mapped != null) return mapped
     return Math.round((c as double) * 9.0d / 5.0d + 32.0d)
 }
 
@@ -1427,6 +1476,9 @@ def cacheCommand(String serial, String field, value) {
     state.commandCache[serial][field] = [value: value, timestamp: now()]
     if (state.deviceData[serial] instanceof Map) {
         state.deviceData[serial][field] = value
+        if (field == "operationMode") {
+            state.deviceData[serial].power = (value as String) == "off" ? 0 : 1
+        }
     }
 }
 
@@ -1477,11 +1529,18 @@ def processCommandQueue(data) {
         return
     }
 
-    if (state.cloudOffline) {
-        log.warn "Cannot send command for ${tailSerial(serial)}: offline and local credentials incomplete; will retry"
-        def waitSec = Math.max(30L, (COMMAND_GAP_MS / 1000L) as long)
-        runIn(waitSec, "processCommandQueue", [data: [serial: serial], overwrite: false])
-        return
+    if (state.cloudOffline && !tokenIsFresh()) {
+        def waitMs = Math.max(30000L, COMMAND_GAP_MS)
+        def lastAttempt = (state.lastOfflineCloudAttempt ?: 0L) as long
+        def sinceAttempt = now() - lastAttempt
+        if (sinceAttempt < waitMs) {
+            def waitSec = Math.max(1L, ((waitMs - sinceAttempt) / 1000L) as long)
+            log.warn "Cannot send command for ${tailSerial(serial)}: cloud offline and local credentials incomplete; retrying in ${waitSec}s"
+            runIn(waitSec, "processCommandQueue", [data: [serial: serial], overwrite: false])
+            return
+        }
+        state.lastOfflineCloudAttempt = now()
+        log.warn "Retrying cloud command for ${tailSerial(serial)} while other units stay on local"
     }
 
     def last = (state.lastCommandSend[serial] ?: 0L) as long
@@ -1526,7 +1585,7 @@ def buildCommandBase(String serial) {
 def componentRefresh(child) {
     def serial = child?.getDataValue("deviceSerial")
     if (!serial) return
-    if (state.cloudOffline || canUseLocal(serial)) {
+    if (canUseLocal(serial)) {
         refreshDeviceDetailLocal(serial)
         localPollAdapter(serial)
     } else {
@@ -1534,7 +1593,7 @@ def componentRefresh(child) {
         apiGet("/devices/${serial}/status", [requestType: "status", serial: serial])
     }
     def zoneId = child.getDataValue("zoneId")
-    if (zoneId && !state.cloudOffline) {
+    if (zoneId && !(state.cloudOffline && state.offlineReady)) {
         apiGet("/zones/${zoneId}/notification-preferences", [
             requestType: "notifications", zoneId: zoneId, serial: serial
         ])
@@ -1838,7 +1897,9 @@ def computeKumoToken(String passwordB64, String cryptoSerialHex, String bodyStr)
 def localPut(String serial, String bodyStr, Map ctx) {
     def creds = state.localCreds[serial]
     if (!(creds instanceof Map)) return false
-    if (state.localInFlight[serial]) return false
+    if (state.localInFlight[serial]) {
+        return deferBusyLocalPut(serial, bodyStr, ctx)
+    }
     def token = computeKumoToken(creds.password as String, creds.cryptoSerial as String, bodyStr)
     if (!token) return false
     def ip = (ctx?.overrideIp ?: creds.address) as String
@@ -1857,6 +1918,27 @@ def localPut(String serial, String bodyStr, Map ctx) {
     ]
     asynchttpPut("localHttpCallback", params, ctx + [serial: serial, bodyStr: bodyStr, retry: ctx?.retry ?: 0])
     return true
+}
+
+def deferBusyLocalPut(String serial, String bodyStr, Map ctx) {
+    def type = ctx?.requestType as String
+    if (type == "localCommand" || type == "localProbe") return false
+    def busyRetry = (ctx?.busyRetry ?: 0) as int
+    if (busyRetry >= 8) {
+        log.warn "Dropped local ${type} for ${tailSerial(serial)}: adapter still busy"
+        return false
+    }
+    runIn(2, "localPutBusyRetry", [
+        data: [serial: serial, bodyStr: bodyStr, ctx: (ctx ?: [:]) + [busyRetry: busyRetry + 1]],
+        overwrite: false
+    ])
+    return true
+}
+
+def localPutBusyRetry(data) {
+    def serial = data?.serial as String
+    if (!serial) return
+    localPut(serial, data.bodyStr as String, (data.ctx ?: [:]) as Map)
 }
 
 def localHttpCallback(response, data) {
@@ -1896,7 +1978,12 @@ def dispatchLocalResponse(String type, parsed, Map data) {
     if (!serial) return
     switch (type) {
         case "localWireless":
-            if (parsed) applyLocalWirelessResponse(serial, parsed)
+            def found = parsed ? applyLocalWirelessResponse(serial, parsed) : false
+            def idx = (data.sensorIndex ?: 0) as int
+            if (!found && parsed && idx < LOCAL_SENSOR_INDEX_MAX) {
+                runIn(1, "localPollWirelessDelayed", [data: [serial: serial, sensorIndex: idx + 1], overwrite: false])
+                return
+            }
             scheduleNextLocalPoll(serial, "wireless")
             break
         case "localMhk2":
@@ -1939,7 +2026,6 @@ def applyLocalStatusResponse(String serial, Map parsed) {
         return
     }
     def device = (state.deviceData[serial] instanceof Map) ? (state.deviceData[serial] as Map) : [:]
-    applyCommandCacheToDevice(serial, device)
     device.operationMode = raw.mode
     device.airDirection = raw.vaneDir
     device.fanSpeed = raw.fanSpeed
@@ -1953,6 +2039,9 @@ def applyLocalStatusResponse(String serial, Map parsed) {
     if (raw.standby != null) device.standby = raw.standby
     if (raw.tempSource != null) device.tempSource = raw.tempSource
     if (raw.activeThermistor != null) device.activeThermistor = raw.activeThermistor
+    // Overlay optimistic commands after raw status so a lagging adapter does not snap the UI back.
+    applyCommandCacheToDevice(serial, device)
+    device.power = (device.operationMode == "off" || device.operationMode == null) ? 0 : 1
     state.deviceData[serial] = device
     state.failCounts[serial] = 0
     pushStateToChildren(serial)
@@ -1961,7 +2050,7 @@ def applyLocalStatusResponse(String serial, Map parsed) {
 
 def localPollWirelessDelayed(data) {
     def serial = data?.serial as String
-    if (serial) localPollWireless(serial)
+    if (serial) localPollWireless(serial, (data.sensorIndex ?: 0) as int)
 }
 
 def localPollMhk2Delayed(data) {
@@ -2009,6 +2098,7 @@ def applyLocalAdapterResponse(String serial, Map parsed) {
         } catch (ignored) {}
         status.runState = adapterStatus.runState
         state.statusData[serial] = status
+        applyInstallerModeLocks(serial, adapterStatus)
         pushDiagnosticState(serial)
         // Follow with adapter info for firmware/hardware (separate PUT).
         runIn(1, "localPollAdapterInfoDelayed", [data: [serial: serial], overwrite: false])
@@ -2027,17 +2117,50 @@ def localPollAdapterInfoDelayed(data) {
     if (serial) localPollAdapterInfo(serial)
 }
 
+def applyInstallerModeLocks(String serial, Map adapterStatus) {
+    if (!serial || !(adapterStatus instanceof Map)) return
+    def stored = state.profiles[serial]
+    def profile = normalizeProfile(stored)
+    if (!profile) return
+
+    def changed = false
+    if (adapterStatus.containsKey("userHasModeDry") && !adapterStatus.userHasModeDry && profile.hasModeDry != false) {
+        profile.hasModeDry = false
+        changed = true
+    }
+    if (adapterStatus.containsKey("userHasModeHeat") && !adapterStatus.userHasModeHeat && profile.hasModeHeat != false) {
+        profile.hasModeHeat = false
+        changed = true
+    }
+    if (adapterStatus.autoModePrevention) {
+        def maxSp = (profile.maximumSetPoints instanceof Map) ? profile.maximumSetPoints : [:]
+        def minSp = (profile.minimumSetPoints instanceof Map) ? profile.minimumSetPoints : [:]
+        if (maxSp.auto == null && minSp.auto == null && profile.hasModeAuto != false) {
+            profile.hasModeAuto = false
+            changed = true
+        }
+    }
+    if (!changed) return
+    if (stored instanceof List) {
+        stored[0] = profile
+        state.profiles[serial] = stored
+    } else {
+        state.profiles[serial] = profile
+    }
+    pushThermostatState(serial)
+}
+
 def applyLocalWirelessResponse(String serial, Map parsed) {
     def sensors = parsed?.r?.sensors
-    if (!(sensors instanceof Map)) return
+    if (!(sensors instanceof Map)) return false
     def matched = null
     sensors.each { k, v ->
         if (matched == null && v instanceof Map && v.uuid) matched = v
     }
-    if (matched instanceof Map) {
-        state.wirelessData[serial] = matched
-        pushWirelessState(serial)
-    }
+    if (!(matched instanceof Map)) return false
+    state.wirelessData[serial] = matched
+    pushWirelessState(serial)
+    return true
 }
 
 def applyLocalMhk2Response(String serial, Map parsed) {
@@ -2091,19 +2214,12 @@ def handleLocalCommandResponse(String serial, Boolean ok) {
     }
     clearFailedCommandCache(serial)
 
-    if (restore.isEmpty()) {
-        if (state.deviceData[serial]) pushStateToChildren(serial)
-        if (state.cloudOffline) {
-            runIn(1, "refreshDeviceDetailLocalDelayed", [data: [serial: serial], overwrite: false])
+    if (!restore.isEmpty()) {
+        if (!(state.commandPending[serial] instanceof Map)) state.commandPending[serial] = [:]
+        restore.each { k, v ->
+            state.commandPending[serial][k] = v
+            cacheCommand(serial, k as String, v)
         }
-        return
-    }
-
-    // Re-queue with cache so subsequent local failures can rebuild the payload again.
-    if (!(state.commandPending[serial] instanceof Map)) state.commandPending[serial] = [:]
-    restore.each { k, v ->
-        state.commandPending[serial][k] = v
-        cacheCommand(serial, k as String, v)
     }
     if (state.deviceData[serial]) pushStateToChildren(serial)
 
@@ -2114,8 +2230,11 @@ def handleLocalCommandResponse(String serial, Boolean ok) {
         return
     }
 
-    // Force cloud fallback for this command instead of tight local retries.
+    // Force cloud fallback instead of tight local retries, even when the cache had nothing to restore.
     state.localDegradedUntil[serial] = now() + LOCAL_DEGRADE_MS
+    if (restore.isEmpty()) {
+        refreshDeviceDetail(serial)
+    }
     processNextCommand(serial)
 }
 
@@ -2139,9 +2258,10 @@ def localPollAdapterInfo(String serial) {
     localPut(serial, LOCAL_ADAPTER_INFO_QUERY, [requestType: "localAdapter"])
 }
 
-def localPollWireless(String serial) {
+def localPollWireless(String serial, Integer index = 0) {
     if (!canUseLocal(serial)) return
-    localPut(serial, '{"c":{"sensors":{"0":{}}}}', [requestType: "localWireless"])
+    def idx = (index ?: 0) as int
+    localPut(serial, "{\"c\":{\"sensors\":{\"${idx}\":{}}}}", [requestType: "localWireless", sensorIndex: idx])
 }
 
 def localPollMhk2(String serial) {
@@ -2173,15 +2293,18 @@ def sendLocalCommands(String serial, Map cloudCommands) {
 
 // --- Socket.IO password fetch ---
 
-def startSocketIoPasswordFetch() {
+def startSocketIoPasswordFetch(Boolean forceAll = false) {
     if (state.cloudOffline || state.socketIoActive) return
     def need = []
     (state.knownSerials ?: []).each { serial ->
         def s = serial as String
         def creds = state.localCreds[s]
-        if (!(creds instanceof Map) || !creds.password) need << s
+        if (forceAll || !(creds instanceof Map) || !creds.password) need << s
     }
-    if (need.isEmpty()) return
+    if (need.isEmpty()) {
+        if (forceAll) log.info "Refresh local credentials: no known units to fetch"
+        return
+    }
     state.socketIoActive = true
     state.socketIoNeed = need
     state.socketIoPasswords = [:]

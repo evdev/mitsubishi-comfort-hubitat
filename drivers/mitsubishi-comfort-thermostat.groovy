@@ -89,6 +89,8 @@ def ensureComponents(Map opts) {
         ensureComponent("mc-${serial}-wireless", "Mitsubishi Comfort Wireless Sensor", "${zoneName} Wireless", [
             deviceSerial: serial, zoneId: zoneId, deviceType: "wireless"
         ])
+    } else {
+        removeComponent("wireless")
     }
 }
 
@@ -112,6 +114,27 @@ def ensureComponent(String dni, String driverName, String label, Map dataValues)
         updateDataValue("dni_${dataValues.deviceType}", dni)
     }
     return child
+}
+
+def removeComponent(String type) {
+    def dni = device.getDataValue("dni_${type}") ?: componentDni(type)
+    def child = dni ? getChildDevice(dni) : null
+    if (!child) {
+        child = componentByType(type)
+        dni = child?.deviceNetworkId as String
+    }
+    if (!child || !dni) return
+    log.info "Removing ${type} component (${dni})"
+    try {
+        deleteChildDevice(dni)
+    } catch (Exception e) {
+        log.error "Failed to remove component ${dni}: ${e.message}"
+        return
+    }
+    device.removeDataValue("dni_${type}")
+    if (state.componentState instanceof Map) {
+        state.componentState.remove(type)
+    }
 }
 
 def componentDni(String type) {
