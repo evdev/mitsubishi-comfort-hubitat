@@ -128,7 +128,11 @@ def mainPage() {
             if (state.loginError) {
                 paragraph "Login error: ${state.loginError}"
             } else if (state.setupSitesLoaded) {
-                paragraph "Login successful. Select your site below."
+                if (tokenIsFresh()) {
+                    paragraph "Login successful. Select your site below."
+                } else {
+                    paragraph "Comfort Cloud account saved. The app will reconnect when you tap Done or Fetch local device keys."
+                }
             }
         }
         section("Site") {
@@ -278,11 +282,11 @@ def credFetchPage() {
 def appButtonHandler(btn) {
     switch (btn) {
         case "btnRefreshCreds":
-            if (tokenIsFresh()) {
-                startSocketIoPasswordFetch(true)
+            if (!ensureCloudAuthForUi()) {
+                setCredFetchBlocked("Could not sign in to Comfort Cloud with the email and password at the top of this page. Check them and try again.")
+                log.warn "Cannot fetch local device keys: Comfort Cloud sign-in failed"
             } else {
-                setCredFetchBlocked("Your Comfort Cloud login isn't active right now. Reopen the app and confirm 'Login successful' above, then try again.")
-                log.warn "Cannot fetch local device keys: cloud token is not fresh"
+                startSocketIoPasswordFetch(true)
             }
             break
         case "btnCancelCredFetch":
@@ -317,6 +321,7 @@ def uninstalled() {
 def initializeApp(Boolean fullInit) {
     unschedule()
     state.pollingScheduled = false
+    state.socketIoActive = false
     ensureStateMaps()
     try {
         ensureAllZoneChildren()
@@ -413,39 +418,17 @@ def ensureStateMaps() {
 
 def loadSetupSites() {
     state.loginError = null
+    def login = syncComfortCloudLogin()
+    if (!login.ok) {
+        state.loginError = login.error ?: "Login failed"
+        return
+    }
+
     try {
-        def loginResp = null
-        httpPost([
-            uri: "${API_BASE}/${API_VERSION}/login",
-            headers: baseHeaders(),
-            body: JsonOutput.toJson([
-                username: settings.username,
-                password: settings.password,
-                appVersion: API_APP_VERSION
-            ]),
-            contentType: "application/json",
-            requestContentType: "application/json",
-            timeout: 30
-        ]) { response -> loginResp = response }
-
-        if (!loginResp || (loginResp.status as int) != 200) {
-            state.loginError = loginResp ? "HTTP ${loginResp.status}" : "No response"
-            return
-        }
-
-        def loginJson = parseMaybeJson(loginResp.data)
-        if (!loginJson?.token?.access) {
-            state.loginError = "Login response missing token"
-            return
-        }
-        state.setupAccessToken = loginJson.token.access
-        state.setupRefreshToken = loginJson.token.refresh
-        state.setupTokenIssuedAt = now()
-
         def sitesResp = null
         httpGet([
             uri: "${API_BASE}/${API_VERSION}/sites/",
-            headers: authHeaders(state.setupAccessToken),
+            headers: authHeaders(atomicState.accessToken),
             contentType: "application/json",
             requestContentType: "application/json",
             timeout: 30
@@ -473,6 +456,86 @@ def loadSetupSites() {
     } catch (Exception e) {
         state.loginError = e.message
         log.error "Setup login failed: ${e.message}"
+    }
+}
+
+def applyAccessTokens(String access, String refresh, Long issuedAt) {
+    atomicState.accessToken = access
+    atomicState.refreshToken = refresh
+    atomicState.tokenExpiresAt = ((issuedAt ?: now()) as long) + TOKEN_TTL_MS
+    atomicState.refreshInProgress = false
+    state.cloudOffline = false
+}
+
+def adoptSetupTokens() {
+    if (!state.setupAccessToken) return false
+    if (hasFreshAccessToken()) return true
+    def issuedAt = (state.setupTokenIssuedAt ?: now()) as long
+    applyAccessTokens(
+        state.setupAccessToken as String,
+        state.setupRefreshToken as String,
+        issuedAt
+    )
+    return (issuedAt + TOKEN_TTL_MS) > (now() + TOKEN_MARGIN_MS)
+}
+
+def hasFreshAccessToken() {
+    return atomicState.accessToken && atomicState.tokenExpiresAt &&
+        ((atomicState.tokenExpiresAt as long) > (now() + TOKEN_MARGIN_MS))
+}
+
+def currentAccessToken() {
+    def token = atomicState.accessToken as String
+    if (token) return token
+    return state.setupAccessToken as String
+}
+
+def ensureCloudAuthForUi() {
+    if (hasFreshAccessToken()) {
+        state.cloudOffline = false
+        return true
+    }
+    if (adoptSetupTokens()) {
+        state.cloudOffline = false
+        return true
+    }
+    if (!settings.username || !settings.password) return false
+    def login = syncComfortCloudLogin()
+    return login.ok == true
+}
+
+def syncComfortCloudLogin() {
+    try {
+        def loginResp = null
+        httpPost([
+            uri: "${API_BASE}/${API_VERSION}/login",
+            headers: baseHeaders(),
+            body: JsonOutput.toJson([
+                username: settings.username,
+                password: settings.password,
+                appVersion: API_APP_VERSION
+            ]),
+            contentType: "application/json",
+            requestContentType: "application/json",
+            timeout: 30
+        ]) { response -> loginResp = response }
+
+        if (!loginResp || (loginResp.status as int) != 200) {
+            return [ok: false, error: loginResp ? "HTTP ${loginResp.status}" : "No response"]
+        }
+
+        def loginJson = parseMaybeJson(loginResp.data)
+        if (!loginJson?.token?.access) {
+            return [ok: false, error: "Login response missing token"]
+        }
+        state.setupAccessToken = loginJson.token.access
+        state.setupRefreshToken = loginJson.token.refresh
+        state.setupTokenIssuedAt = now()
+        applyAccessTokens(loginJson.token.access as String, loginJson.token.refresh as String, now())
+        return [ok: true]
+    } catch (Exception e) {
+        log.error "Comfort Cloud login failed: ${e.message}"
+        return [ok: false, error: e.message]
     }
 }
 
@@ -508,8 +571,8 @@ def onOfflineBoot(String nextStep) {
 }
 
 def tokenIsFresh() {
-    return atomicState.accessToken && atomicState.tokenExpiresAt &&
-        ((atomicState.tokenExpiresAt as long) > (now() + TOKEN_MARGIN_MS))
+    if (hasFreshAccessToken()) return true
+    return adoptSetupTokens()
 }
 
 def stepNeedsLocalPoll(String step) {
@@ -2386,7 +2449,12 @@ def sendLocalCommands(String serial, Map cloudCommands) {
 // --- Socket.IO password fetch ---
 
 def startSocketIoPasswordFetch(Boolean forceAll = false) {
-    if (state.socketIoActive) return
+    if (state.socketIoActive) {
+        def deadline = (state.socketIoDeadline ?: 0L) as long
+        if (!forceAll && now() <= deadline) return
+        log.info "Resetting previous device-key fetch before starting a new one"
+        state.socketIoActive = false
+    }
     if (state.cloudOffline) {
         if (forceAll) {
             setCredFetchBlocked("Cloud is unreachable. Local device keys can only be fetched while online.")
@@ -2403,7 +2471,17 @@ def startSocketIoPasswordFetch(Boolean forceAll = false) {
         if (forceAll) {
             def known = state.knownSerials ?: []
             if (!(known instanceof List) || known.isEmpty()) {
-                setCredFetchBlocked("No zones discovered yet. Save credentials and a site first.")
+                if (settings.siteId && tokenIsFresh()) {
+                    state.credFetch = [
+                        status: "running",
+                        message: "Discovering zones first. Device keys will fetch automatically after that.",
+                        total: 0,
+                        found: 0
+                    ]
+                    discoverZones()
+                    return
+                }
+                setCredFetchBlocked("No zones discovered yet. Select your site above, then tap Done.")
             } else {
                 state.credFetch = [
                     status: "complete",
@@ -2435,7 +2513,7 @@ def socketIoHandshake() {
         httpGet([
             uri: "${SOCKET_BASE}/socket.io/",
             query: [EIO: "4", transport: "polling"],
-            headers: ["Accept": "*/*", "Authorization": "Bearer ${atomicState.accessToken}"],
+            headers: ["Accept": "*/*", "Authorization": "Bearer ${currentAccessToken()}"],
             timeout: 15
         ]) { response ->
             def text = response?.data?.toString() ?: ""
@@ -2461,7 +2539,7 @@ def socketIoPost(String payload) {
             query: [EIO: "4", transport: "polling", sid: state.socketIoSid],
             headers: [
                 "Accept": "*/*",
-                "Authorization": "Bearer ${atomicState.accessToken}",
+                "Authorization": "Bearer ${currentAccessToken()}",
                 "Content-Type": "text/plain;charset=UTF-8"
             ],
             body: payload,
@@ -2482,7 +2560,7 @@ def socketIoPoll() {
         httpGet([
             uri: "${SOCKET_BASE}/socket.io/",
             query: [EIO: "4", transport: "polling", sid: state.socketIoSid],
-            headers: ["Accept": "*/*", "Authorization": "Bearer ${atomicState.accessToken}"],
+            headers: ["Accept": "*/*", "Authorization": "Bearer ${currentAccessToken()}"],
             timeout: 25
         ]) { response ->
             def text = response?.data?.toString() ?: ""
@@ -2546,7 +2624,7 @@ def socketIoHandleText(String raw) {
 
 def jwtUserId() {
     try {
-        def token = atomicState.accessToken as String
+        def token = currentAccessToken()
         if (!token) return null
         def parts = token.split("\\.")
         if (parts.size() < 2) return null
