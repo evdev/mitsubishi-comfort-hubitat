@@ -2533,6 +2533,27 @@ def startSocketIoPasswordFetch(Boolean forceAll = false, Boolean isRetry = false
     } else {
         log.warn "Comfort Cloud user id not found before socket fetch — adapter keys may not arrive"
     }
+    persistCredFetch([
+        status: "running",
+        message: "Fetching local device keys from Comfort Cloud…",
+        total: need.size(),
+        found: 0,
+        startedAt: now()
+    ])
+    log.info "Trying legacy Comfort Cloud login before socket fetch"
+    tryLegacyPasswordFetch(need)
+    need = need.findAll { s -> !state.localCreds[s]?.password }
+    if (need.isEmpty()) {
+        persistCredFetch([
+            status: "complete",
+            message: "${(state.knownSerials ?: []).size()} of ${(state.knownSerials ?: []).size()} device keys fetched.",
+            total: (state.knownSerials ?: []).size(),
+            found: (state.knownSerials ?: []).size()
+        ])
+        recomputeOfflineReady()
+        if (settings.enableSubnetScan) startIpDiscovery()
+        return
+    }
     log.info "Socket.IO fetch starting ${need.size()} zone(s) accountSubscribe=${userId ? 'yes' : 'NO'}"
     sioStateSet([
         active: true,
@@ -2566,7 +2587,8 @@ def socketIoHeaders() {
     return [
         "Accept": "text/plain, */*",
         "Authorization": "Bearer ${currentAccessToken()}",
-        "User-Agent": "kumocloud/1122"
+        "User-Agent": "kumocloud/1122",
+        "x-app-version": API_APP_VERSION
     ]
 }
 
@@ -3055,10 +3077,11 @@ def harvestPasswordNode(node) {
 }
 
 def harvestPasswordMap(Map info, String eventName) {
-    def pw = info.password as String
+    def pw = firstPasswordField(info)
     def s = (info.deviceSerial ?: info.serial) as String
     if (eventName == "adapter_update") {
-        log.info "Socket.IO adapter_update serial=${s ? tailSerial(s) : 'none'} hasKey=${pw ? 'yes' : 'no'}"
+        def keys = info.keySet().collect { it?.toString() }.join(",")
+        log.info "Socket.IO adapter_update serial=${s ? tailSerial(s) : 'none'} hasKey=${pw ? 'yes' : 'no'} keys=${keys}"
     }
     if (s && pw) {
         socketIoSavePassword(s, pw)
@@ -3067,6 +3090,23 @@ def harvestPasswordMap(Map info, String eventName) {
     info.each { k, v ->
         if (v instanceof Map || v instanceof List) harvestPasswordNode(v)
     }
+}
+
+def firstPasswordField(Map info) {
+    if (!info) return null
+    def found = null
+    ["password", "localPassword", "unitPassword", "adapterPassword", "devicePassword"].each { name ->
+        if (found) return
+        def v = info[name]
+        if ((v instanceof String) && v) found = v
+    }
+    if (found) return found
+    info.each { k, v ->
+        if (found) return
+        def name = k?.toString()?.toLowerCase()
+        if (name?.contains("pass") && !name.contains("ssid") && (v instanceof String) && v) found = v
+    }
+    return found
 }
 
 def socketIoSavePassword(String serial, String password) {
@@ -3162,18 +3202,29 @@ def fetchKumoUserIdFromAccount() {
     }
 }
 
-def tryLegacyPasswordFetch() {
+def tryLegacyPasswordFetch(serials = null) {
     if (!settings.username || !settings.password) return
     log.info "Trying legacy Comfort Cloud login for local device keys"
+    def targets = (serials ?: sioState().need ?: state.socketIoNeed ?: state.knownSerials ?: []) as List
     def data = legacyLoginJson(false)
-    if (data == null) data = legacyLoginJson(true)
-    if (data == null) return
     def found = [:]
-    walkLegacyCreds(data, found)
+    if (data != null) {
+        log.info "Legacy login response ${legacyDescribe(data)}"
+        walkLegacyCreds(data, found)
+    }
+    if (found.isEmpty()) {
+        data = legacyLoginJson(true)
+        if (data != null) {
+            log.info "Legacy login (app key) response ${legacyDescribe(data)}"
+            walkLegacyCreds(data, found)
+        }
+    }
     log.info "Legacy login walked ${found.size()} credential entr${found.size() == 1 ? 'y' : 'ies'}"
+    if (found.isEmpty() && data != null) {
+        log.warn "Legacy login JSON had no device keys (${legacyDescribe(data)})"
+    }
     def applied = 0
-    def serials = (sioState().need ?: state.socketIoNeed ?: state.knownSerials ?: []) as List
-    serials.each { serial ->
+    targets.each { serial ->
         def s = serial as String
         def cred = found[s]
         if (!(cred instanceof Map)) {
@@ -3191,14 +3242,22 @@ def tryLegacyPasswordFetch() {
     if (applied) {
         log.info "Legacy Comfort Cloud login provided ${applied} local device key(s)"
     } else if (found) {
-        log.warn "Legacy login returned ${found.size()} key(s) but none matched known zone serials"
+        log.warn "Legacy login returned ${found.size()} key(s) but none matched known zone serials (${found.keySet().collect { tailSerial(it as String) }})"
     }
+}
+
+def legacyDescribe(data) {
+    if (data instanceof List) return "list size=${data.size()}"
+    if (data instanceof Map) return "map keys=${data.keySet()}"
+    if (data == null) return "null"
+    return "text len=${data.toString().length()}"
 }
 
 def legacyLoginJson(Boolean withAppKey) {
     try {
         def headers = [
             "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en",
             "Content-Type": "application/json"
         ]
         if (withAppKey) headers["Application-Key"] = LEGACY_APP_KEY
@@ -3211,7 +3270,7 @@ def legacyLoginJson(Boolean withAppKey) {
                 password: settings.password,
                 appVersion: LEGACY_APP_VERSION
             ]),
-            contentType: "application/json",
+            contentType: "text/plain",
             requestContentType: "application/json",
             timeout: 20
         ]) { response -> loginResp = response }
@@ -3220,7 +3279,11 @@ def legacyLoginJson(Boolean withAppKey) {
             log.warn "Legacy credential fetch${withAppKey ? ' (app key)' : ''}: HTTP ${status}"
             return null
         }
-        return parseMaybeJson(loginResp.data)
+        def raw = loginResp.data
+        if (!(raw instanceof Map) && !(raw instanceof List) && raw != null) {
+            return parseMaybeJson(raw.toString())
+        }
+        return parseMaybeJson(raw)
     } catch (Exception e) {
         log.warn "Legacy credential fetch${withAppKey ? ' (app key)' : ''} failed: ${e.message}"
         return null
@@ -3233,20 +3296,32 @@ def walkLegacyCreds(node, Map found) {
         return
     }
     if (!(node instanceof Map)) return
+    harvestLegacyDevice(node, null, found)
+    def zoneTable = node.zoneTable
+    if (zoneTable instanceof Map) {
+        zoneTable.each { key, value ->
+            if (value instanceof Map) harvestLegacyDevice(value, key as String, found)
+        }
+    }
     node.each { key, value ->
+        if (key?.toString() == "zoneTable") return
         if (value instanceof Map) {
-            def pw = value.password
-            if ((pw instanceof String) && pw && (value.cryptoSerial || (key as String).length() >= 8)) {
-                found[key as String] = [
-                    password: pw as String,
-                    cryptoSerial: (value.cryptoSerial ?: "") as String
-                ]
-            }
+            harvestLegacyDevice(value, key as String, found)
             walkLegacyCreds(value, found)
         } else if (value instanceof List) {
             walkLegacyCreds(value, found)
         }
     }
+}
+
+def harvestLegacyDevice(Map raw, String keyHint, Map found) {
+    def serial = (raw.serial ?: raw.deviceSerial ?: keyHint) as String
+    def pw = firstPasswordField(raw)
+    if (!serial || !pw) return
+    found[serial] = [
+        password: pw as String,
+        cryptoSerial: (raw.cryptoSerial ?: "") as String
+    ]
 }
 
 def finishSocketIo(String reason) {
