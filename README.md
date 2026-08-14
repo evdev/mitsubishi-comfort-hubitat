@@ -98,12 +98,13 @@ Indoor, filter, diagnostics, and wireless devices are recreated as children of t
 
 When **Prefer local LAN control** is enabled (default), the app talks directly to each Wi-Fi adapter on your LAN (`HTTP PUT` to port 80) instead of routing commands through Kumo Cloud. This matches the protocol used by [pykumo](https://github.com/dlarrick/pykumo) and Home Assistant's [mitsubishi-comfort](https://github.com/nikolairahimi/mitsubishi-comfort) library.
 
-**First-time setup requires internet** to discover zones and fetch per-unit local passwords (via Kumo Socket.IO). After that:
+**First-time setup requires internet** to discover zones and fetch a per-unit **local device key** from Comfort Cloud. You never type that key. After that:
 
-1. Enter each zone's **LAN IP** in the app settings (recommended; use DHCP reservations on your router). Each zone shows **Found**, **Not set**, or **Waiting for local password**.
-2. Or tap **Find missing unit IPs** / open **Find unit IPs** to probe the LAN. The subnet field is pre-filled from the hub's own address (change it only if the units are on a different LAN). Scan is optional and can take several minutes; the Find unit IPs page shows progress and which zones matched.
-3. Optionally enable **Automatically scan for missing IPs after login** so missing addresses are probed after cloud login.
-4. With cached credentials + IPs, **Allow offline local control** keeps thermostats working when the internet or Kumo Cloud is down.
+1. Tap **Fetch local device keys** (or open **Device key status**). Wait 15–30 seconds. Each zone should show **Device key: Cached**.
+2. Enter each zone's **LAN IP** in the boxes (recommended; use DHCP reservations on your router). Those fields are IP addresses only — not passwords. Each zone shows **IP: Found** or **IP: Not set**.
+3. Or tap **Find missing unit IPs** / open **Find unit IPs** to probe the LAN. The subnet field is pre-filled from the hub's own address (change it only if the units are on a different LAN). Scan is optional and can take several minutes; it requires device keys from step 1.
+4. Optionally enable **Automatically scan for missing IPs after login** so missing addresses are probed after cloud login.
+5. With cached device keys + IPs, **Allow offline local control** keeps thermostats working when the internet or Kumo Cloud is down.
 
 Filter reminder metadata still requires cloud access when online. In offline mode, filter values show last-known data.
 
@@ -115,9 +116,9 @@ Filter reminder metadata still requires cloud access when online. In offline mod
 | Devices show stale | Cloud poll failures; check hub internet and logs |
 | Setpoint drift in °F | Expected if hub uses °C; verify `location.temperatureScale` |
 | Commands ignored | Cloud rate-limits rapid changes; wait 5+ seconds between adjustments |
-| Local control not working | Enter unit IP in app settings, or use **Find missing unit IPs**; use **Refresh local credentials** after cloud login |
-| Subnet scan finds nothing | Confirm the subnet matches the hub LAN; tap **Refresh local credentials** first; watch **Find unit IPs** for status |
-| Offline mode not engaging | All zones need password, crypto serial, and IP cached; check **Offline ready** in app |
+| Local control not working | Fetch local device keys, then enter each unit IP (or use **Find missing unit IPs**) |
+| Subnet scan finds nothing | Confirm device keys show Cached; confirm the subnet matches the hub LAN; watch **Find unit IPs** for status |
+| Offline mode not engaging | All zones need a cached device key, crypto serial, and IP; check **Offline ready** in the app |
 
 Enable **Debug logging** in app settings (auto-disables after 30 minutes). Check **Logs** for lines prefixed with device serial suffixes.
 

@@ -103,6 +103,7 @@ preferences {
     page(name: "mainPage")
     page(name: "cleanupPage")
     page(name: "ipScanPage")
+    page(name: "credFetchPage")
 }
 
 def mainPage() {
@@ -145,22 +146,13 @@ def mainPage() {
             ], defaultValue: "60", required: true
         }
         section("Local control") {
-            paragraph "Local control needs each unit's LAN IP. Type them below (DHCP reservations recommended) or scan the subnet. Scan is optional and can take several minutes."
+            paragraph "Each zone needs two things for local control: a local device key (fetched automatically — you never type it) and a LAN IP (type it below, or scan). Cloud control works without either."
             input name: "preferLocal", type: "bool", title: "Prefer local LAN control", defaultValue: true
             input name: "allowOffline", type: "bool", title: "Allow offline local control when internet is down", defaultValue: true
-            input name: "enableSubnetScan", type: "bool", title: "Automatically scan for missing IPs after login", defaultValue: false, submitOnChange: true
-            def hubIp = hubLocalIp()
-            def hubPrefix = hubSubnetPrefix()
-            input name: "subnetOverride", type: "text", title: "Subnet to scan (e.g. 192.168.1)", defaultValue: hubPrefix ?: "", required: false
-            if (hubIp && hubPrefix) {
-                paragraph "Subnet is pre-filled from this hub (${hubIp}). Change only if units are on a different LAN. Use the first three octets, e.g. ${hubPrefix}."
-            } else {
-                paragraph "Enter the first three octets of the LAN the units are on, e.g. 192.168.1."
-            }
             if (state.offlineReady) {
-                paragraph "Offline ready: cached credentials and IPs allow local control without internet."
+                paragraph "Offline ready: cached device keys and IPs allow local control without internet."
             } else if (state.knownSerials instanceof List && !state.knownSerials.isEmpty()) {
-                paragraph "Offline not ready: enter unit IPs below and ensure cloud login has fetched local passwords."
+                paragraph "Offline not ready: fetch local device keys, then enter or scan unit IPs below."
             }
             if (state.cloudOffline) {
                 paragraph "Operating in offline local-only mode (cloud unreachable)."
@@ -168,6 +160,16 @@ def mainPage() {
             if (state.lastCloudContact) {
                 paragraph "Last cloud contact: ${state.lastCloudContact}"
             }
+
+            paragraph "Step 1 — Local device keys. These come from your Comfort Cloud login automatically. There is no password to type here. Tap Fetch local device keys, then wait about 15–30 seconds."
+            def fetching = credFetchRunning()
+            input name: "btnRefreshCreds", type: "button", title: "Fetch local device keys", disabled: fetching == true
+            href name: "credFetchPageHref", page: "credFetchPage", title: fetching ? "Watch device key progress" : "Device key status",
+                description: credFetchHrefDescription(), state: allDeviceKeysFound() ? "complete" : ""
+            def credSnapshot = credFetchSnapshotText()
+            if (credSnapshot) paragraph credSnapshot
+
+            paragraph "Step 2 — Unit LAN IPs. The boxes below are IP addresses only (for example 192.168.1.44), not passwords. DHCP reservations on your router are recommended. Scan is optional."
             if (state.zoneIndex instanceof Map && !state.zoneIndex.isEmpty()) {
                 state.zoneIndex.each { serial, info ->
                     def s = serial as String
@@ -177,11 +179,20 @@ def mainPage() {
                     def shown = stored ?: discovered
                     input name: ipKey, type: "text", title: "${info?.zoneName ?: s} IP", defaultValue: shown ?: "", required: false
                     paragraph unitIpStatusLine(s)
+                    paragraph unitDeviceKeyStatusLine(s)
                 }
+            }
+            input name: "enableSubnetScan", type: "bool", title: "Automatically scan for missing IPs after login", defaultValue: false, submitOnChange: true
+            def hubIp = hubLocalIp()
+            def hubPrefix = hubSubnetPrefix()
+            input name: "subnetOverride", type: "text", title: "Subnet to scan (e.g. 192.168.1)", defaultValue: hubPrefix ?: "", required: false
+            if (hubIp && hubPrefix) {
+                paragraph "Subnet is pre-filled from this hub (${hubIp}). Change only if units are on a different LAN. Use the first three octets, e.g. ${hubPrefix}."
+            } else {
+                paragraph "Enter the first three octets of the LAN the units are on, e.g. 192.168.1."
             }
             def snapshot = ipScanSnapshotText()
             if (snapshot) paragraph snapshot
-            input name: "btnRefreshCreds", type: "button", title: "Refresh local credentials"
             def scanning = state.ipScan?.status == "running"
             input name: "btnFindMissingIps", type: "button", title: "Find missing unit IPs", disabled: scanning == true
             href name: "ipScanPageHref", page: "ipScanPage", title: scanning ? "Watch scan progress" : "Find unit IPs",
@@ -216,7 +227,7 @@ def ipScanPage() {
     dynamicPage(name: "ipScanPage", title: "Find unit IPs", uninstall: false, install: false, refreshInterval: running ? 4 : 0) {
         section("Scan") {
             def subnet = resolvedSubnetPrefix()
-            paragraph "Probes ${(subnet ?: 'your subnet')}.x for units that do not yet have an IP. Local passwords must be cached first (Refresh local credentials). A full subnet scan can take several minutes."
+            paragraph "Probes ${(subnet ?: 'your subnet')}.x for units that do not yet have an IP. Fetch local device keys first (Step 1 on the settings page) — the scan authenticates with each unit and cannot run without those keys. A full subnet scan can take several minutes."
             if (scan.message) paragraph scan.message as String
             if (running) {
                 paragraph ipScanProgressBar()
@@ -233,7 +244,33 @@ def ipScanPage() {
             renderIpScanUnitStatus()
         }
         section("Back") {
-            href name: "backToMain", page: "mainPage", title: "Back to settings"
+            href name: "backToMainFromScan", page: "mainPage", title: "Back to settings"
+        }
+    }
+}
+
+def credFetchPage() {
+    def fetch = credFetchMap()
+    def running = fetch.status == "running"
+    dynamicPage(name: "credFetchPage", title: "Local device keys", uninstall: false, install: false, refreshInterval: running ? 4 : 0) {
+        section("Fetch") {
+            paragraph "Local device keys are retrieved automatically from Comfort Cloud using the email and password you already entered above. You never type a device key. This usually takes 15–30 seconds."
+            if (fetch.message) paragraph fetch.message as String
+            if (running) {
+                def found = (fetch.found ?: 0) as int
+                def total = (fetch.total ?: 0) as int
+                paragraph "Received ${found} of ${total}."
+            }
+            input name: "btnRefreshCreds", type: "button", title: running ? "Fetching…" : "Fetch local device keys", disabled: running == true
+            if (running) {
+                input name: "btnCancelCredFetch", type: "button", title: "Cancel fetch"
+            }
+        }
+        section("Units") {
+            renderCredFetchUnitStatus()
+        }
+        section("Back") {
+            href name: "backToMainFromCreds", page: "mainPage", title: "Back to settings"
         }
     }
 }
@@ -244,8 +281,12 @@ def appButtonHandler(btn) {
             if (tokenIsFresh()) {
                 startSocketIoPasswordFetch(true)
             } else {
-                log.warn "Cannot refresh local credentials: cloud token is not fresh"
+                setCredFetchBlocked("Your Comfort Cloud login isn't active right now. Reopen the app and confirm 'Login successful' above, then try again.")
+                log.warn "Cannot fetch local device keys: cloud token is not fresh"
             }
+            break
+        case "btnCancelCredFetch":
+            cancelCredFetch()
             break
         case "btnFindMissingIps":
             startIpDiscovery()
@@ -365,6 +406,7 @@ def ensureStateMaps() {
     if (!(state.lastConnectionPath instanceof Map)) state.lastConnectionPath = [:]
     if (!(state.ipProbeActive instanceof Map)) state.ipProbeActive = [:]
     if (!(state.ipScan instanceof Map)) state.ipScan = [:]
+    if (!(state.credFetch instanceof Map)) state.credFetch = [:]
 }
 
 // --- Setup-time synchronous auth ---
@@ -2344,7 +2386,13 @@ def sendLocalCommands(String serial, Map cloudCommands) {
 // --- Socket.IO password fetch ---
 
 def startSocketIoPasswordFetch(Boolean forceAll = false) {
-    if (state.cloudOffline || state.socketIoActive) return
+    if (state.socketIoActive) return
+    if (state.cloudOffline) {
+        if (forceAll) {
+            setCredFetchBlocked("Cloud is unreachable. Local device keys can only be fetched while online.")
+        }
+        return
+    }
     def need = []
     (state.knownSerials ?: []).each { serial ->
         def s = serial as String
@@ -2352,7 +2400,19 @@ def startSocketIoPasswordFetch(Boolean forceAll = false) {
         if (forceAll || !(creds instanceof Map) || !creds.password) need << s
     }
     if (need.isEmpty()) {
-        if (forceAll) log.info "Refresh local credentials: no known units to fetch"
+        if (forceAll) {
+            def known = state.knownSerials ?: []
+            if (!(known instanceof List) || known.isEmpty()) {
+                setCredFetchBlocked("No zones discovered yet. Save credentials and a site first.")
+            } else {
+                state.credFetch = [
+                    status: "complete",
+                    message: "All zones already have a local device key.",
+                    total: known.size(),
+                    found: known.size()
+                ]
+            }
+        }
         return
     }
     state.socketIoActive = true
@@ -2360,6 +2420,13 @@ def startSocketIoPasswordFetch(Boolean forceAll = false) {
     state.socketIoPasswords = [:]
     state.socketIoDeadline = now() + 60000L
     state.socketIoStep = "handshake"
+    state.credFetch = [
+        status: "running",
+        message: "Fetching local device keys from Comfort Cloud…",
+        total: need.size(),
+        found: 0,
+        startedAt: now()
+    ]
     socketIoHandshake()
 }
 
@@ -2451,6 +2518,7 @@ def socketIoHandleText(String raw) {
                             ensureLocalCredEntry(s)
                             state.localCreds[s].password = pw
                             state.socketIoPasswords[s] = pw
+                            updateCredFetchFound()
                         }
                     }
                 }
@@ -2496,6 +2564,7 @@ def jwtUserId() {
 def finishSocketIo(String reason) {
     state.socketIoActive = false
     log.info "Socket.IO password fetch finished: ${reason}"
+    finalizeCredFetch(reason)
     recomputeOfflineReady()
     if (settings.enableSubnetScan) startIpDiscovery()
 }
@@ -2580,11 +2649,117 @@ def resolvedUnitIp(String serial) {
 
 def unitIpStatusLine(String serial) {
     def ip = resolvedUnitIp(serial)
-    if (ip) return "Found ${ip}"
+    if (ip) return "IP: Found ${ip}"
+    return "IP: Not set — type it above, or scan below"
+}
+
+def unitHasDeviceKey(String serial) {
     def creds = state.localCreds?.get(serial)
-    def hasPw = creds instanceof Map && creds.password && creds.cryptoSerial
-    if (!hasPw) return "Waiting for local password — tap Refresh local credentials first"
-    return "Not set — enter an IP or scan"
+    return creds instanceof Map && creds.password
+}
+
+def unitDeviceKeyStatusLine(String serial) {
+    if (unitHasDeviceKey(serial)) return "Device key: Cached"
+    if (credFetchRunning()) return "Device key: Fetching…"
+    return "Device key: Not yet available — tap Fetch local device keys above"
+}
+
+def allDeviceKeysFound() {
+    def serials = state.knownSerials ?: []
+    if (!(serials instanceof List) || serials.isEmpty()) return false
+    return serials.every { unitHasDeviceKey(it as String) }
+}
+
+def credFetchMap() {
+    return (state.credFetch instanceof Map) ? ([:] + (state.credFetch as Map)) : [:]
+}
+
+def credFetchRunning() {
+    return state.credFetch?.status == "running"
+}
+
+def credFetchSnapshotText() {
+    def fetch = credFetchMap()
+    if (!fetch.status || fetch.status == "idle") return ""
+    return (fetch.message ?: "") as String
+}
+
+def credFetchHrefDescription() {
+    def fetch = credFetchMap()
+    if (fetch.status == "running") {
+        return "Fetching ${fetch.found ?: 0} of ${fetch.total ?: 0} — tap to watch"
+    }
+    if (fetch.message) return fetch.message as String
+    return "Shows whether each zone's local device key has been fetched"
+}
+
+def setCredFetchBlocked(String message) {
+    state.credFetch = [
+        status: "blocked",
+        message: message,
+        total: 0,
+        found: 0
+    ]
+    log.info "Device key fetch not started: ${message}"
+}
+
+def updateCredFetchFound() {
+    def fetch = credFetchMap()
+    if (fetch.status != "running") return
+    fetch.found = (state.socketIoPasswords instanceof Map) ? state.socketIoPasswords.size() : 0
+    fetch.message = "Fetching… ${fetch.found} of ${fetch.total ?: 0} device keys received."
+    state.credFetch = fetch
+}
+
+def finalizeCredFetch(String reason) {
+    def fetch = credFetchMap()
+    if (fetch.status == "cancelled") return
+    def need = (state.socketIoNeed ?: []) as List
+    def got = (state.socketIoPasswords instanceof Map) ? state.socketIoPasswords.keySet() : ([] as Set)
+    def found = need.count { it in got } as int
+    def total = need.size() as int
+    fetch.found = found
+    fetch.total = total
+    if (reason == "complete" || (total > 0 && found == total)) {
+        fetch.status = "complete"
+        fetch.message = "${found} of ${total} device keys fetched."
+    } else if (reason == "timeout") {
+        fetch.status = "timeout"
+        def missing = total - found
+        fetch.message = "${found} of ${total} device keys fetched. ${missing} zone(s) did not respond — try again, or check that the unit is on Wi-Fi."
+    } else {
+        fetch.status = "error"
+        fetch.message = "Could not fetch device keys (${reason}). Confirm Login successful above and try again."
+    }
+    state.credFetch = fetch
+}
+
+def cancelCredFetch() {
+    state.socketIoActive = false
+    def fetch = credFetchMap()
+    fetch.status = "cancelled"
+    fetch.message = "Fetch cancelled."
+    state.credFetch = fetch
+    log.info "Device key fetch cancelled"
+}
+
+def renderCredFetchUnitStatus() {
+    def serials = state.knownSerials ?: (state.zoneIndex instanceof Map ? state.zoneIndex.keySet() as List : [])
+    if (serials == null || serials.size() == 0) {
+        paragraph "No zones discovered yet. Save credentials and a site first."
+        return
+    }
+    serials.each { serial ->
+        def s = serial as String
+        def name = zoneDisplayName(s)
+        if (unitHasDeviceKey(s)) {
+            paragraph "${name} — cached"
+        } else if (credFetchRunning()) {
+            paragraph "${name} — fetching…"
+        } else {
+            paragraph "${name} — not yet available"
+        }
+    }
 }
 
 def allUnitIpsFound() {
@@ -2762,8 +2937,12 @@ def startIpDiscovery() {
             alreadyHaveIp++
             return
         }
-        if (!(creds instanceof Map) || !creds.password || !creds.cryptoSerial) {
-            skipped[s] = "waiting for local password"
+        if (!(creds instanceof Map) || !creds.password) {
+            skipped[s] = "no local device key yet"
+            return
+        }
+        if (!creds.cryptoSerial) {
+            skipped[s] = "waiting for unit status from cloud"
             return
         }
         serials << s
@@ -2772,7 +2951,7 @@ def startIpDiscovery() {
     if (serials.isEmpty()) {
         def parts = []
         if (alreadyHaveIp) parts << "${alreadyHaveIp} already have an IP"
-        if (!skipped.isEmpty()) parts << "${skipped.size()} waiting for local password (tap Refresh local credentials)"
+        if (!skipped.isEmpty()) parts << "${skipped.size()} zones don't have a local device key yet — tap Fetch local device keys above, then try scanning again"
         def msg = parts.isEmpty() ? "No units to scan." : "Nothing to scan: ${parts.join('; ')}."
         setIpScanBlocked(msg)
         return
