@@ -100,9 +100,10 @@ When **Prefer local LAN control** is enabled (default), the app talks directly t
 
 **First-time setup requires internet** to discover zones and fetch per-unit local passwords (via Kumo Socket.IO). After that:
 
-1. Enter each zone's **LAN IP** in the app settings (recommended; use DHCP reservations on your router).
-2. Optionally enable **Scan subnet for unit IPs** to probe your network.
-3. With cached credentials + IPs, **Allow offline local control** keeps thermostats working when the internet or Kumo Cloud is down.
+1. Enter each zone's **LAN IP** in the app settings (recommended; use DHCP reservations on your router). Each zone shows **Found**, **Not set**, or **Waiting for local password**.
+2. Or tap **Find missing unit IPs** / open **Find unit IPs** to probe the LAN. The subnet field is pre-filled from the hub's own address (change it only if the units are on a different LAN). Scan is optional and can take several minutes; the Find unit IPs page shows progress and which zones matched.
+3. Optionally enable **Automatically scan for missing IPs after login** so missing addresses are probed after cloud login.
+4. With cached credentials + IPs, **Allow offline local control** keeps thermostats working when the internet or Kumo Cloud is down.
 
 Filter reminder metadata still requires cloud access when online. In offline mode, filter values show last-known data.
 
@@ -114,7 +115,8 @@ Filter reminder metadata still requires cloud access when online. In offline mod
 | Devices show stale | Cloud poll failures; check hub internet and logs |
 | Setpoint drift in °F | Expected if hub uses °C; verify `location.temperatureScale` |
 | Commands ignored | Cloud rate-limits rapid changes; wait 5+ seconds between adjustments |
-| Local control not working | Enter unit IP in app settings; use **Refresh local credentials** after cloud login |
+| Local control not working | Enter unit IP in app settings, or use **Find missing unit IPs**; use **Refresh local credentials** after cloud login |
+| Subnet scan finds nothing | Confirm the subnet matches the hub LAN; tap **Refresh local credentials** first; watch **Find unit IPs** for status |
 | Offline mode not engaging | All zones need password, crypto serial, and IP cached; check **Offline ready** in app |
 
 Enable **Debug logging** in app settings (auto-disables after 30 minutes). Check **Logs** for lines prefixed with device serial suffixes.

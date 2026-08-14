@@ -78,6 +78,10 @@ Use this checklist after installing on a Hubitat hub with a real Comfort Cloud a
 
 - [ ] After cloud login, **Refresh local credentials** populates passwords (check logs)
 - [ ] Manual unit IP entry enables local polls (`connectionPath` = `local`)
+- [ ] Subnet field is pre-filled from the hub LAN prefix (editable)
+- [ ] Each zone IP field shows Found / Not set / Waiting for local password
+- [ ] **Find missing unit IPs** fills the matching IP fields and the Find unit IPs page shows progress
+- [ ] Blocked scan (no passwords, all IPs set, bad subnet) shows a reason instead of failing silently
 - [ ] Mode/setpoint/fan/vane commands work via local path
 - [ ] Local command latency is lower than cloud-only path
 - [ ] Cloud fallback works when local IP is wrong (degraded → `connectionPath` = `cloud`)

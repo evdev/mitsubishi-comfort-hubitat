@@ -39,6 +39,7 @@ definition(
 @Field static final Long LOCAL_DEGRADE_MS = 5L * 60L * 1000L
 @Field static final Long OFFLINE_PROBE_MS = 10L * 60L * 1000L
 @Field static final Integer LOCAL_HTTP_TIMEOUT = 8
+@Field static final Integer IP_PROBE_HOST_MAX = 254
 @Field static final Integer CRYPTO_SERIAL_MIN_BYTES = 9
 @Field static final Integer LOCAL_SENSOR_INDEX_MAX = 3
 @Field static final String LOCAL_STATUS_QUERY = '{"c":{"indoorUnit":{"status":{}}}}'
@@ -101,6 +102,7 @@ definition(
 preferences {
     page(name: "mainPage")
     page(name: "cleanupPage")
+    page(name: "ipScanPage")
 }
 
 def mainPage() {
@@ -115,6 +117,8 @@ def mainPage() {
     if (settings.username && settings.password && !state.setupSitesLoaded) {
         loadSetupSites()
     }
+    ensureSubnetSetting()
+    backfillIpSettingsFromState()
 
     dynamicPage(name: "mainPage", title: "Mitsubishi Comfort", install: true, uninstall: true) {
         section("Comfort Cloud credentials") {
@@ -141,10 +145,18 @@ def mainPage() {
             ], defaultValue: "60", required: true
         }
         section("Local control") {
+            paragraph "Local control needs each unit's LAN IP. Type them below (DHCP reservations recommended) or scan the subnet. Scan is optional and can take several minutes."
             input name: "preferLocal", type: "bool", title: "Prefer local LAN control", defaultValue: true
             input name: "allowOffline", type: "bool", title: "Allow offline local control when internet is down", defaultValue: true
-            input name: "enableSubnetScan", type: "bool", title: "Scan subnet for unit IPs (optional)", defaultValue: false
-            input name: "subnetOverride", type: "text", title: "Subnet to scan (e.g. 192.168.1)", required: false
+            input name: "enableSubnetScan", type: "bool", title: "Automatically scan for missing IPs after login", defaultValue: false, submitOnChange: true
+            def hubIp = hubLocalIp()
+            def hubPrefix = hubSubnetPrefix()
+            input name: "subnetOverride", type: "text", title: "Subnet to scan (e.g. 192.168.1)", defaultValue: hubPrefix ?: "", required: false
+            if (hubIp && hubPrefix) {
+                paragraph "Subnet is pre-filled from this hub (${hubIp}). Change only if units are on a different LAN. Use the first three octets, e.g. ${hubPrefix}."
+            } else {
+                paragraph "Enter the first three octets of the LAN the units are on, e.g. 192.168.1."
+            }
             if (state.offlineReady) {
                 paragraph "Offline ready: cached credentials and IPs allow local control without internet."
             } else if (state.knownSerials instanceof List && !state.knownSerials.isEmpty()) {
@@ -158,15 +170,22 @@ def mainPage() {
             }
             if (state.zoneIndex instanceof Map && !state.zoneIndex.isEmpty()) {
                 state.zoneIndex.each { serial, info ->
-                    def ipKey = unitIpSettingKey(serial as String)
-                    def title = "${info?.zoneName ?: serial} IP"
-                    def cur = state.localCreds?.get(serial)?.address
-                    if (cur) title = "${title} (current: ${cur})"
-                    input name: ipKey, type: "text", title: title, required: false
+                    def s = serial as String
+                    def ipKey = unitIpSettingKey(s)
+                    def stored = settings[ipKey]?.toString()?.trim()
+                    def discovered = state.localCreds?.get(s)?.address?.toString()?.trim()
+                    def shown = stored ?: discovered
+                    input name: ipKey, type: "text", title: "${info?.zoneName ?: s} IP", defaultValue: shown ?: "", required: false
+                    paragraph unitIpStatusLine(s)
                 }
             }
+            def snapshot = ipScanSnapshotText()
+            if (snapshot) paragraph snapshot
             input name: "btnRefreshCreds", type: "button", title: "Refresh local credentials"
-            input name: "btnRediscoverIp", type: "button", title: "Re-discover local IPs"
+            def scanning = state.ipScan?.status == "running"
+            input name: "btnFindMissingIps", type: "button", title: "Find missing unit IPs", disabled: scanning == true
+            href name: "ipScanPageHref", page: "ipScanPage", title: scanning ? "Watch scan progress" : "Find unit IPs",
+                description: ipScanHrefDescription(), state: allUnitIpsFound() ? "complete" : ""
         }
         section("Diagnostics") {
             input name: "debugLogging", type: "bool", title: "Debug logging (auto-off after 30 min)", defaultValue: false
@@ -191,6 +210,34 @@ def cleanupPage() {
     }
 }
 
+def ipScanPage() {
+    def scan = ipScanMap()
+    def running = scan.status == "running"
+    dynamicPage(name: "ipScanPage", title: "Find unit IPs", uninstall: false, install: false, refreshInterval: running ? 4 : 0) {
+        section("Scan") {
+            def subnet = resolvedSubnetPrefix()
+            paragraph "Probes ${(subnet ?: 'your subnet')}.x for units that do not yet have an IP. Local passwords must be cached first (Refresh local credentials). A full subnet scan can take several minutes."
+            if (scan.message) paragraph scan.message as String
+            if (running) {
+                paragraph ipScanProgressBar()
+                if (scan.currentIp) {
+                    paragraph "Current: ${scan.currentIp} (${zoneDisplayName(scan.currentSerial as String)})"
+                }
+            }
+            input name: "btnFindMissingIps", type: "button", title: running ? "Scan running…" : "Start scan", disabled: running == true
+            if (running) {
+                input name: "btnCancelIpScan", type: "button", title: "Cancel scan"
+            }
+        }
+        section("Units") {
+            renderIpScanUnitStatus()
+        }
+        section("Back") {
+            href name: "backToMain", page: "mainPage", title: "Back to settings"
+        }
+    }
+}
+
 def appButtonHandler(btn) {
     switch (btn) {
         case "btnRefreshCreds":
@@ -200,8 +247,11 @@ def appButtonHandler(btn) {
                 log.warn "Cannot refresh local credentials: cloud token is not fresh"
             }
             break
-        case "btnRediscoverIp":
+        case "btnFindMissingIps":
             startIpDiscovery()
+            break
+        case "btnCancelIpScan":
+            cancelIpDiscovery()
             break
     }
 }
@@ -313,8 +363,8 @@ def ensureStateMaps() {
     if (!(state.localFailCounts instanceof Map)) state.localFailCounts = [:]
     if (!(state.localDegradedUntil instanceof Map)) state.localDegradedUntil = [:]
     if (!(state.lastConnectionPath instanceof Map)) state.lastConnectionPath = [:]
-    if (!(state.ipProbeQueue instanceof List)) state.ipProbeQueue = []
     if (!(state.ipProbeActive instanceof Map)) state.ipProbeActive = [:]
+    if (!(state.ipScan instanceof Map)) state.ipScan = [:]
 }
 
 // --- Setup-time synchronous auth ---
@@ -1731,10 +1781,16 @@ def syncManualIpSettings() {
         def s = serial as String
         def key = unitIpSettingKey(s)
         def ip = settings[key]?.toString()?.trim()
-        if (!ip) return
-        ensureLocalCredEntry(s)
-        state.localCreds[s].address = ip
-        state.localCreds[s].addressLocked = true
+        if (ip) {
+            ensureLocalCredEntry(s)
+            state.localCreds[s].address = ip
+            state.localCreds[s].addressLocked = true
+        } else {
+            def stateIp = state.localCreds?.get(s)?.address?.toString()?.trim()
+            if (stateIp) {
+                app.updateSetting(key, [type: "text", value: stateIp])
+            }
+        }
     }
     recomputeOfflineReady()
 }
@@ -1948,7 +2004,8 @@ def localHttpCallback(response, data) {
     def parsed = (status >= 200 && status < 300) ? parseAsyncBody(response) : null
     def ok = parsed instanceof Map && parsed.r != null
 
-    if (!ok && (data.retry as int) < 1 && (status == 0 || status == 408)) {
+    def isProbe = data.requestType == "localProbe"
+    if (!ok && !isProbe && (data.retry as int) < 1 && (status == 0 || status == 408)) {
         state.localInFlight[serial] = false
         runIn(1, "localPutRetry", [data: data + [retry: 1], overwrite: false])
         return
@@ -1960,7 +2017,7 @@ def localHttpCallback(response, data) {
         recordLocalSuccess(serial)
         dispatchLocalResponse(data.requestType as String, parsed, data)
     } else {
-        if (data.requestType != "localProbe") {
+        if (!isProbe) {
             recordLocalFailure(serial)
         }
         dispatchLocalResponse(data.requestType as String, null, data)
@@ -1994,14 +2051,7 @@ def dispatchLocalResponse(String type, parsed, Map data) {
             handleLocalCommandResponse(serial, parsed != null)
             break
         case "localProbe":
-            if (parsed) {
-                ensureLocalCredEntry(serial)
-                state.localCreds[serial].address = data.probeIp as String
-                recomputeOfflineReady()
-                log.info "Matched ${tailSerial(serial)} to IP ${data.probeIp}"
-                state.ipProbeSerialIdx = ((state.ipProbeSerialIdx ?: 0) as int) + 1
-                state.ipProbeIpIdx = 0
-            }
+            handleLocalProbeResponse(serial, parsed, data)
             break
         case "localProfile":
             if (parsed) applyLocalProfileResponse(serial, parsed)
@@ -2452,47 +2502,418 @@ def finishSocketIo(String reason) {
 
 // --- IP discovery ---
 
+def hubLocalIp() {
+    def ip = null
+    try { ip = location?.hub?.localIP as String } catch (Exception ignored) { }
+    if (!ip) {
+        try { ip = location?.hubs[0]?.localIP as String } catch (Exception ignored) { }
+    }
+    if (!ip) {
+        try { ip = getHub()?.localIP as String } catch (Exception ignored) { }
+    }
+    if (!ip) {
+        try { ip = location?.hub?.getDataValue("localIP") as String } catch (Exception ignored) { }
+    }
+    if (ip) {
+        ip = ip.toString().trim()
+        if (ip.contains(".")) return ip
+    }
+    return null
+}
+
+def hubSubnetPrefix() {
+    return subnetPrefixFromIp(hubLocalIp())
+}
+
+def subnetPrefixFromIp(String ip) {
+    if (!ip) return null
+    def cleaned = ip.replaceAll("/.*", "").trim()
+    def parts = cleaned.split("\\.")
+    if (parts.size() < 3) return null
+    return "${parts[0]}.${parts[1]}.${parts[2]}"
+}
+
+def resolvedSubnetPrefix() {
+    def fromSetting = subnetPrefixFromIp(settings.subnetOverride?.toString())
+    return fromSetting ?: hubSubnetPrefix()
+}
+
+def ensureSubnetSetting() {
+    if (settings.subnetOverride?.toString()?.trim()) return
+    def prefix = hubSubnetPrefix()
+    if (!prefix) return
+    app.updateSetting("subnetOverride", [type: "text", value: prefix])
+}
+
+def backfillIpSettingsFromState() {
+    if (!(state.zoneIndex instanceof Map)) return
+    state.zoneIndex.each { serial, info ->
+        def s = serial as String
+        def key = unitIpSettingKey(s)
+        def settingIp = settings[key]?.toString()?.trim()
+        def stateIp = state.localCreds?.get(s)?.address?.toString()?.trim()
+        if (!settingIp && stateIp) {
+            app.updateSetting(key, [type: "text", value: stateIp])
+        }
+    }
+}
+
+def applyDiscoveredIp(String serial, String ip) {
+    if (!serial || !ip) return
+    ensureLocalCredEntry(serial)
+    state.localCreds[serial].address = ip
+    app.updateSetting(unitIpSettingKey(serial), [type: "text", value: ip])
+    recomputeOfflineReady()
+}
+
+def zoneDisplayName(String serial) {
+    if (!serial) return "?"
+    def info = state.zoneIndex?.get(serial)
+    return (info?.zoneName ?: serial) as String
+}
+
+def resolvedUnitIp(String serial) {
+    def fromSetting = settings[unitIpSettingKey(serial)]?.toString()?.trim()
+    if (fromSetting) return fromSetting
+    return state.localCreds?.get(serial)?.address?.toString()?.trim()
+}
+
+def unitIpStatusLine(String serial) {
+    def ip = resolvedUnitIp(serial)
+    if (ip) return "Found ${ip}"
+    def creds = state.localCreds?.get(serial)
+    def hasPw = creds instanceof Map && creds.password && creds.cryptoSerial
+    if (!hasPw) return "Waiting for local password — tap Refresh local credentials first"
+    return "Not set — enter an IP or scan"
+}
+
+def allUnitIpsFound() {
+    def serials = state.knownSerials ?: []
+    if (!(serials instanceof List) || serials.isEmpty()) return false
+    return serials.every { resolvedUnitIp(it as String) }
+}
+
+def ipScanMap() {
+    return (state.ipScan instanceof Map) ? ([:] + (state.ipScan as Map)) : [:]
+}
+
+def ipScanSnapshotText() {
+    def scan = ipScanMap()
+    if (!scan.status || scan.status == "idle") {
+        def known = state.knownSerials
+        if (!(known instanceof List) || known.isEmpty()) return ""
+        return "Scan has not been run. Type IPs above or tap Find missing unit IPs."
+    }
+    if (scan.status == "running") {
+        def host = (scan.ipIdx ?: 0) as int
+        def total = (scan.ipTotal ?: IP_PROBE_HOST_MAX) as int
+        return "Scanning ${scan.subnet ?: ''}.x — ${host}/${total}. Open Find unit IPs to watch progress."
+    }
+    return (scan.message ?: "") as String
+}
+
+def ipScanHrefDescription() {
+    def scan = ipScanMap()
+    if (scan.status == "running") {
+        def host = (scan.ipIdx ?: 0) as int
+        def total = (scan.ipTotal ?: IP_PROBE_HOST_MAX) as int
+        return "Scanning ${host}/${total} — tap to watch"
+    }
+    if (scan.message) return scan.message as String
+    return "Optional: probe the LAN for units without an IP"
+}
+
+def ipScanProgressBar() {
+    def scan = ipScanMap()
+    def serialTotal = Math.max(1, (scan.serialTotal ?: 1) as int)
+    def serialIdx = (scan.serialIdx ?: 0) as int
+    def ipIdx = (scan.ipIdx ?: 0) as int
+    def ipTotal = Math.max(1, (scan.ipTotal ?: IP_PROBE_HOST_MAX) as int)
+    def done = serialIdx * ipTotal + ipIdx
+    def total = serialTotal * ipTotal
+    def pct = Math.min(100, (int)((done * 100) / total))
+    def filled = (int)((pct * 20) / 100)
+    def bar = ""
+    for (int i = 0; i < 20; i++) {
+        bar += (i < filled) ? "█" : "░"
+    }
+    def unitPart = serialTotal > 1 ? "unit ${Math.min(serialIdx + 1, serialTotal)}/${serialTotal}, " : ""
+    return "${bar} ${pct}% (${unitPart}host ${ipIdx}/${ipTotal})"
+}
+
+def renderIpScanUnitStatus() {
+    def scan = ipScanMap()
+    def matched = (scan.matched instanceof Map) ? scan.matched : [:]
+    def skipped = (scan.skipped instanceof Map) ? scan.skipped : [:]
+    def notFound = (scan.notFound instanceof List) ? scan.notFound : []
+    def pending = (scan.pending instanceof List) ? scan.pending : []
+    def current = scan.currentSerial as String
+    def serials = state.knownSerials ?: (state.zoneIndex instanceof Map ? state.zoneIndex.keySet() as List : [])
+    if (!serials) {
+        paragraph "No zones discovered yet. Save credentials and a site first."
+        return
+    }
+    serials.each { serial ->
+        def s = serial as String
+        def name = zoneDisplayName(s)
+        def ip = matched[s] ?: resolvedUnitIp(s)
+        if (ip) {
+            paragraph "${name} — found ${ip}"
+        } else if (s in notFound) {
+            paragraph "${name} — not found. Enter the IP manually."
+        } else if (skipped[s]) {
+            paragraph "${name} — skipped (${skipped[s]})"
+        } else if (scan.status == "running" && s == current) {
+            paragraph "${name} — searching ${scan.currentIp ?: ''}…"
+        } else if (s in pending || scan.status == "running") {
+            paragraph "${name} — waiting"
+        } else {
+            paragraph "${name} — ${unitIpStatusLine(s)}"
+        }
+    }
+}
+
+def setIpScanBlocked(String message) {
+    state.ipScan = [
+        status: "blocked",
+        message: message,
+        subnet: resolvedSubnetPrefix() ?: "",
+        currentIp: "",
+        ipIdx: 0,
+        ipTotal: IP_PROBE_HOST_MAX,
+        serialIdx: 0,
+        serialTotal: 0,
+        currentSerial: "",
+        matched: [:],
+        pending: [],
+        skipped: [:],
+        notFound: []
+    ]
+    log.info "IP scan not started: ${message}"
+}
+
+def recordIpScanMatch(String serial, String ip) {
+    def scan = ipScanMap()
+    def matched = (scan.matched instanceof Map) ? ([:] + (scan.matched as Map)) : [:]
+    matched[serial] = ip
+    scan.matched = matched
+    scan.pending = ((scan.pending instanceof List) ? (scan.pending as List) : []).findAll { it != serial }
+    scan.message = "Matched ${zoneDisplayName(serial)} at ${ip}"
+    state.ipScan = scan
+}
+
+def recordIpScanNotFound(String serial) {
+    def scan = ipScanMap()
+    def notFound = ((scan.notFound instanceof List) ? (scan.notFound as List) : []) + [serial]
+    scan.notFound = notFound
+    scan.pending = ((scan.pending instanceof List) ? (scan.pending as List) : []).findAll { it != serial }
+    scan.message = "No match for ${zoneDisplayName(serial)} on ${scan.subnet ?: ''}.x"
+    state.ipScan = scan
+}
+
+def updateIpScanProgress(String serial, String ip, int host) {
+    def scan = ipScanMap()
+    scan.currentIp = ip
+    scan.ipIdx = host
+    scan.currentSerial = serial
+    scan.serialIdx = (state.ipProbeSerialIdx ?: 0) as int
+    scan.message = "Probing ${ip} for ${zoneDisplayName(serial)}"
+    state.ipScan = scan
+}
+
+def assignedIps() {
+    def ips = [] as Set
+    (state.localCreds ?: [:]).each { serial, creds ->
+        if (creds instanceof Map && creds.address) {
+            ips << creds.address.toString()
+        }
+    }
+    def hubIp = hubLocalIp()
+    if (hubIp) ips << hubIp.toString()
+    return ips
+}
+
 def startIpDiscovery() {
-    def candidates = buildCandidateIpList()
-    if (!candidates) return
-    def serials = (state.knownSerials ?: []).findAll { serial ->
+    if (state.ipScan?.status == "running") {
+        log.info "IP scan already running"
+        return
+    }
+
+    def subnet = resolvedSubnetPrefix()
+    if (!subnet) {
+        setIpScanBlocked("Could not determine subnet. Enter the first three octets (e.g. 192.168.1) and try again.")
+        return
+    }
+    ensureSubnetSetting()
+
+    def known = (state.knownSerials ?: []) as List
+    if (known.isEmpty()) {
+        setIpScanBlocked("No zones discovered yet. Save credentials and a site first.")
+        return
+    }
+
+    def skipped = [:]
+    def serials = []
+    def alreadyHaveIp = 0
+    known.each { serial ->
         def s = serial as String
         def creds = state.localCreds[s]
-        return creds instanceof Map && creds.password && creds.cryptoSerial && !creds.address
+        if (creds instanceof Map && creds.address) {
+            alreadyHaveIp++
+            return
+        }
+        if (!(creds instanceof Map) || !creds.password || !creds.cryptoSerial) {
+            skipped[s] = "waiting for local password"
+            return
+        }
+        serials << s
     }
-    if (!serials) return
+
+    if (serials.isEmpty()) {
+        def parts = []
+        if (alreadyHaveIp) parts << "${alreadyHaveIp} already have an IP"
+        if (!skipped.isEmpty()) parts << "${skipped.size()} waiting for local password (tap Refresh local credentials)"
+        def msg = parts.isEmpty() ? "No units to scan." : "Nothing to scan: ${parts.join('; ')}."
+        setIpScanBlocked(msg)
+        return
+    }
+
+    state.ipScanGen = ((state.ipScanGen ?: 0) as int) + 1
+    state.ipProbeSeq = 0
+    state.ipProbeHandledSeq = -1
     state.ipProbeSerials = serials
-    state.ipProbeCandidates = candidates
     state.ipProbeSerialIdx = 0
-    state.ipProbeIpIdx = 0
+    state.ipProbeHost = 1
+    state.ipProbeSubnet = subnet
+    state.remove("ipProbeCandidates")
+    state.remove("ipProbeIpIdx")
+
+    state.ipScan = [
+        status: "running",
+        message: "Scanning ${subnet}.x for ${serials.size()} unit(s)…",
+        subnet: subnet,
+        currentIp: "",
+        ipIdx: 0,
+        ipTotal: IP_PROBE_HOST_MAX,
+        serialIdx: 0,
+        serialTotal: serials.size(),
+        currentSerial: serials[0],
+        matched: [:],
+        pending: serials.collect { it },
+        skipped: skipped,
+        notFound: []
+    ]
+    log.info "IP scan started on ${subnet}.x for ${serials.size()} unit(s)"
     scheduleNextIpProbe()
 }
 
-def scheduleNextIpProbe() {
-    def serials = state.ipProbeSerials ?: []
-    def candidates = state.ipProbeCandidates ?: []
-    def sIdx = (state.ipProbeSerialIdx ?: 0) as int
-    def iIdx = (state.ipProbeIpIdx ?: 0) as int
+def cancelIpDiscovery() {
+    state.ipScanGen = ((state.ipScanGen ?: 0) as int) + 1
+    unschedule("ipProbeTimeout")
+    unschedule("scheduleNextIpProbe")
+    clearIpProbeRuntime()
+    def scan = ipScanMap()
+    scan.status = "cancelled"
+    scan.message = "Scan cancelled."
+    scan.currentIp = ""
+    state.ipScan = scan
+    log.info "IP scan cancelled"
+}
 
-    if (!serials || sIdx >= serials.size()) {
-        state.remove("ipProbeSerials")
-        state.remove("ipProbeCandidates")
-        state.remove("ipProbeSerialIdx")
-        state.remove("ipProbeIpIdx")
+def clearIpProbeRuntime() {
+    state.remove("ipProbeSerials")
+    state.remove("ipProbeCandidates")
+    state.remove("ipProbeSerialIdx")
+    state.remove("ipProbeIpIdx")
+    state.remove("ipProbeHost")
+    state.remove("ipProbeSubnet")
+}
+
+def probeEventIsCurrent(Map data) {
+    def gen = (data?.scanGen ?: 0) as int
+    def seq = (data?.probeSeq ?: 0) as int
+    if (gen != ((state.ipScanGen ?: 0) as int)) return false
+    if (state.ipScan?.status != "running") return false
+    if (((state.ipProbeHandledSeq ?: -1) as int) >= seq) return false
+    state.ipProbeHandledSeq = seq
+    return true
+}
+
+def handleLocalProbeResponse(String serial, parsed, Map data) {
+    if (parsed) {
+        applyDiscoveredIp(serial, data.probeIp as String)
+        log.info "Matched ${tailSerial(serial)} to IP ${data.probeIp}"
+    }
+    if (!probeEventIsCurrent(data)) return
+    unschedule("ipProbeTimeout")
+    if (parsed) {
+        recordIpScanMatch(serial, data.probeIp as String)
+        state.ipProbeSerialIdx = ((state.ipProbeSerialIdx ?: 0) as int) + 1
+        state.ipProbeHost = 1
+    }
+    runIn(1, "scheduleNextIpProbe", [overwrite: true])
+}
+
+def ipProbeTimeout(data) {
+    if (!probeEventIsCurrent(data instanceof Map ? data : [:])) return
+    def serial = data?.serial as String
+    if (serial) {
+        state.ipProbeActive?.remove(serial)
+        state.localInFlight[serial] = false
+    }
+    runIn(1, "scheduleNextIpProbe", [overwrite: true])
+}
+
+def finishIpDiscovery() {
+    unschedule("ipProbeTimeout")
+    unschedule("scheduleNextIpProbe")
+    clearIpProbeRuntime()
+    def scan = ipScanMap()
+    def matched = (scan.matched instanceof Map) ? scan.matched.size() : 0
+    def notFound = (scan.notFound instanceof List) ? scan.notFound.size() : 0
+    scan.status = "complete"
+    scan.currentIp = ""
+    scan.message = "Scan complete: ${matched} found, ${notFound} not found."
+    if (notFound) {
+        scan.message = "${scan.message} Enter remaining IPs manually."
+    }
+    state.ipScan = scan
+    log.info scan.message
+}
+
+def scheduleNextIpProbe() {
+    if (state.ipScan?.status != "running") return
+
+    def serials = state.ipProbeSerials ?: []
+    def sIdx = (state.ipProbeSerialIdx ?: 0) as int
+    def subnet = state.ipProbeSubnet as String
+
+    if (!serials || sIdx >= serials.size() || !subnet) {
+        finishIpDiscovery()
         return
     }
 
     def serial = serials[sIdx] as String
     if (state.localCreds[serial]?.address) {
+        recordIpScanMatch(serial, state.localCreds[serial].address as String)
         state.ipProbeSerialIdx = sIdx + 1
-        state.ipProbeIpIdx = 0
+        state.ipProbeHost = 1
         runIn(1, "scheduleNextIpProbe", [overwrite: true])
         return
     }
 
-    if (iIdx >= candidates.size()) {
+    def host = (state.ipProbeHost ?: 1) as int
+    def skip = assignedIps()
+    while (host <= IP_PROBE_HOST_MAX) {
+        def candidate = "${subnet}.${host}".toString()
+        if (!(candidate in skip)) break
+        host++
+    }
+
+    if (host > IP_PROBE_HOST_MAX) {
+        recordIpScanNotFound(serial)
         state.ipProbeSerialIdx = sIdx + 1
-        state.ipProbeIpIdx = 0
+        state.ipProbeHost = 1
         runIn(1, "scheduleNextIpProbe", [overwrite: true])
         return
     }
@@ -2502,27 +2923,32 @@ def scheduleNextIpProbe() {
         return
     }
 
-    def ip = candidates[iIdx] as String
-    state.ipProbeIpIdx = iIdx + 1
+    def ip = "${subnet}.${host}".toString()
+    state.ipProbeHost = host + 1
     state.ipProbeActive[serial] = true
-    localPut(serial, LOCAL_STATUS_QUERY, [requestType: "localProbe", probeIp: ip, probeSerial: serial, overrideIp: ip])
-    runIn(2, "scheduleNextIpProbe", [overwrite: true])
-}
+    state.ipProbeSeq = ((state.ipProbeSeq ?: 0) as int) + 1
+    def seq = state.ipProbeSeq as int
+    def gen = (state.ipScanGen ?: 0) as int
+    updateIpScanProgress(serial, ip, host)
 
-def buildCandidateIpList() {
-    def subnet = settings.subnetOverride?.trim()
-    if (!subnet) {
-        def hubIp = location?.hub?.ipAddress as String
-        if (!hubIp || !hubIp.contains(".")) return []
-        def parts = hubIp.split("\\.")
-        if (parts.size() != 4) return []
-        subnet = "${parts[0]}.${parts[1]}.${parts[2]}"
+    def sent = localPut(serial, LOCAL_STATUS_QUERY, [
+        requestType: "localProbe",
+        probeIp: ip,
+        probeSerial: serial,
+        overrideIp: ip,
+        scanGen: gen,
+        probeSeq: seq
+    ])
+    if (!sent) {
+        state.ipProbeActive?.remove(serial)
+        runIn(1, "scheduleNextIpProbe", [overwrite: true])
+        return
     }
-    def list = []
-    for (int i = 1; i <= 254; i++) {
-        list << "${subnet}.${i}"
-    }
-    return list
+
+    runIn(LOCAL_HTTP_TIMEOUT + 4, "ipProbeTimeout", [
+        overwrite: true,
+        data: [scanGen: gen, probeSeq: seq, serial: serial]
+    ])
 }
 
 def logDebug(msg) {
