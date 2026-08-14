@@ -20,31 +20,16 @@ Hubitat Elevation integration for **Mitsubishi Comfort** / **Kumo Cloud** V3 HVA
 ### Hubitat Package Manager (recommended)
 
 1. Install [Hubitat Package Manager](https://github.com/HubitatCommunity/hubitatpackagemanager) if you do not already have it.
-2. Open **Hubitat Package Manager** on your hub.
-3. Choose one of these methods:
-
-**Option A — Match URL (fastest)**
-
-1. Tap **Match URL**
-2. Paste this manifest URL:
-
-   `https://raw.githubusercontent.com/evdev/mitsubishi-comfort-hubitat/main/packageManifest.json`
-
-3. Install **Mitsubishi Comfort Cloud** (app + all drivers)
-
-**Option B — Custom repository**
-
-1. In HPM, open **Settings** → **Bundle Manager Repositories**
-2. Add this repository URL:
-
-   `https://raw.githubusercontent.com/evdev/mitsubishi-comfort-hubitat/main/repository.json`
-
-3. Return to HPM, search for **Mitsubishi Comfort Cloud**, and install
-
+2. In HPM, choose **Install** and search for **Mitsubishi Comfort Cloud**.
+3. Select **Mitsubishi Comfort Cloud** and install (app + all drivers).
 4. In Hubitat: **Apps** → **Add User App** → **Mitsubishi Comfort**
 5. Enter your Comfort app email and password (the page reloads after each field)
 6. Select your site when the dropdown appears
 7. Choose poll interval and tap **Done**
+
+If it does not appear in search yet, add this custom repository URL under HPM **Settings**, then install:
+
+`https://raw.githubusercontent.com/evdev/mitsubishi-comfort-hubitat/main/repository.json`
 
 Child devices are created automatically after the first successful discovery. Each zone appears as a thermostat; indoor, filter, diagnostics, and wireless sensors nest under that thermostat and can be collapsed in the Devices list.
 

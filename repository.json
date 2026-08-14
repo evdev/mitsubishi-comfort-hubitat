@@ -3,10 +3,16 @@
   "gitHubUrl": "https://github.com/evdev/mitsubishi-comfort-hubitat",
   "packages": [
     {
+      "id": "bae8a9d3-407c-41b0-9749-3ad0a1aca6af",
       "name": "Mitsubishi Comfort Cloud",
       "category": "Integrations",
       "location": "https://raw.githubusercontent.com/evdev/mitsubishi-comfort-hubitat/main/packageManifest.json",
-      "description": "Cloud integration for Mitsubishi Comfort / Kumo Cloud V3 HVAC zones, thermostats, sensors, and profile-based setpoint limits."
+      "description": "Cloud integration for Mitsubishi Comfort / Kumo Cloud V3 HVAC zones, thermostats, sensors, and profile-based setpoint limits.",
+      "tags": [
+        "Climate Control",
+        "Temperature & Humidity",
+        "Cloud"
+      ]
     }
   ]
 }
