@@ -2629,6 +2629,13 @@ def socketIoAsyncText(response, parsed) {
     return text
 }
 
+def socketIoParsedKind(parsed) {
+    if (parsed instanceof Map) return "map"
+    if (parsed instanceof List) return "list"
+    if (parsed != null) return "yes"
+    return "none"
+}
+
 def socketIoLogSnippet(String text) {
     if (!text) return "(empty)"
     def snippet = text.take(180)
@@ -2654,7 +2661,7 @@ def socketIoAsyncCallback(response, data) {
     def parsed = socketIoAsyncParsed(response)
     def text = socketIoAsyncText(response, parsed)
     def errFlag = socketIoHasHttpError(response)
-    log.info "Socket.IO ${method} ${step} HTTP ${status} err=${errFlag} parsed=${parsed != null ? parsed.getClass().simpleName : 'none'} len=${text.length()} ${socketIoLogSnippet(text)}"
+    log.info "Socket.IO ${method} ${step} HTTP ${status} err=${errFlag} parsed=${socketIoParsedKind(parsed)} len=${text.length()} ${socketIoLogSnippet(text)}"
 
     if (status == 401) {
         socketIoRetryAuth("unauthorized")
