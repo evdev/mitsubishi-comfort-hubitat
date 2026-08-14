@@ -28,6 +28,8 @@ definition(
 
 @Field static final String API_BASE = "https://app-prod.kumocloud.com"
 @Field static final String SOCKET_BASE = "https://socket-prod.kumocloud.com"
+@Field static final String LEGACY_API_BASE = "https://geo-c.kumocloud.com"
+@Field static final String LEGACY_APP_VERSION = "2.2.0"
 @Field static final String API_VERSION = "v3"
 @Field static final String API_APP_VERSION = "3.2.4"
 @Field static final Long TOKEN_TTL_MS = 20L * 60L * 1000L
@@ -532,6 +534,7 @@ def syncComfortCloudLogin() {
         state.setupRefreshToken = loginJson.token.refresh
         state.setupTokenIssuedAt = now()
         applyAccessTokens(loginJson.token.access as String, loginJson.token.refresh as String, now())
+        captureKumoUserId(loginJson)
         return [ok: true]
     } catch (Exception e) {
         log.error "Comfort Cloud login failed: ${e.message}"
@@ -710,6 +713,7 @@ def authCallback(response, data) {
             }
             atomicState.tokenExpiresAt = now() + TOKEN_TTL_MS
             atomicState.refreshInProgress = false
+            captureKumoUserId(json)
             onAuthSuccess()
         } else {
             atomicState.refreshInProgress = false
@@ -2496,8 +2500,9 @@ def startSocketIoPasswordFetch(Boolean forceAll = false) {
     state.socketIoActive = true
     state.socketIoNeed = need
     state.socketIoPasswords = [:]
-    state.socketIoDeadline = now() + 60000L
+    state.socketIoDeadline = now() + 90000L
     state.socketIoStep = "handshake"
+    state.remove("socketIoSid")
     state.credFetch = [
         status: "running",
         message: "Fetching local device keys from Comfort Cloud…",
@@ -2510,44 +2515,145 @@ def startSocketIoPasswordFetch(Boolean forceAll = false) {
 
 def socketIoHandshake() {
     try {
-        httpGet([
-            uri: "${SOCKET_BASE}/socket.io/",
-            query: [EIO: "4", transport: "polling"],
-            headers: ["Accept": "*/*", "Authorization": "Bearer ${currentAccessToken()}"],
-            timeout: 15
-        ]) { response ->
-            def text = response?.data?.toString() ?: ""
-            if (!text.startsWith("0")) {
-                finishSocketIo("handshake failed")
+        def hs = socketIoRequest("GET", [EIO: "4", transport: "polling"], null, 15)
+        def jsonText = extractEngineIoOpenPacket(hs.text as String)
+        if (!jsonText) {
+            finishSocketIo("handshake failed")
+            log.warn "Socket.IO handshake unexpected: ${(hs.text ?: '').take(120)}"
+            return
+        }
+        def sid = new JsonSlurper().parseText(jsonText)?.sid as String
+        if (!sid) {
+            finishSocketIo("handshake missing sid")
+            return
+        }
+        state.socketIoSid = sid
+        log.info "Socket.IO handshake ok"
+        def q = [EIO: "4", transport: "polling", sid: sid]
+
+        socketIoRequest("POST", q, "40", 10)
+        def connected = socketIoRequest("GET", q, null, 15)
+        def connectText = connected.text as String
+        if (engineIoHasConnectError(connectText)) {
+            log.warn "Socket.IO namespace rejected"
+            if (state.socketIoRetryOnce != true && ensureCloudAuthForUi()) {
+                state.socketIoRetryOnce = true
+                state.socketIoActive = false
+                startSocketIoPasswordFetch(true)
                 return
             }
-            def sid = new JsonSlurper().parseText(text.substring(1)).sid
-            state.socketIoSid = sid as String
-            state.socketIoStep = "connect"
-            socketIoPost("40")
-            runIn(1, "socketIoPoll", [overwrite: false])
+            finishSocketIo("namespace rejected")
+            return
         }
+        extractSocketIoPasswords(connectText)
+
+        def userId = jwtUserId()
+        if (!userId) userId = fetchKumoUserIdFromAccount()
+        if (userId) {
+            log.info "Socket.IO account-level subscribe"
+            socketIoRequest("POST", q, "42[\"subscribe\",\"\",\"${userId}\"]", 10)
+            extractSocketIoPasswords(socketIoRequest("GET", q, null, 15).text as String)
+        } else {
+            log.warn "No Comfort Cloud user id — device keys may not arrive via adapter_update"
+        }
+
+        def serials = (state.socketIoNeed ?: []) as List
+        if (serials) {
+            def subs = serials.collect { s -> "42[\"subscribe\",\"${s}\"]" }.join("\u001e")
+            socketIoRequest("POST", q, subs, 10)
+            extractSocketIoPasswords(socketIoRequest("GET", q, null, 15).text as String)
+
+            def forces = serials.collect { s -> "42[\"force_adapter_request\",\"${s}\",\"adapterStatus\"]" }.join("\u001e")
+            socketIoRequest("POST", q, forces, 10)
+
+            def statuses = ["42[\"device_status_v2\",\"\"]"]
+            serials.each { s -> statuses << "42[\"device_status_v2\",\"${s}\"]" }
+            socketIoRequest("POST", q, statuses.join("\u001e"), 10)
+        }
+
+        state.socketIoStep = "polling"
+        state.socketIoDeadline = now() + 60000L
+        if (socketIoNeedRemaining().isEmpty()) {
+            finishSocketIo("complete")
+            return
+        }
+        runIn(1, "socketIoPoll", [overwrite: true])
     } catch (Exception e) {
         finishSocketIo("handshake error: ${e.message}")
     }
 }
 
-def socketIoPost(String payload) {
-    try {
-        httpPost([
-            uri: "${SOCKET_BASE}/socket.io/",
-            query: [EIO: "4", transport: "polling", sid: state.socketIoSid],
-            headers: [
-                "Accept": "*/*",
-                "Authorization": "Bearer ${currentAccessToken()}",
-                "Content-Type": "text/plain;charset=UTF-8"
-            ],
-            body: payload,
-            timeout: 10
-        ]) { response -> }
-    } catch (Exception e) {
-        log.warn "Socket.IO post failed: ${e.message}"
+def socketIoHeaders() {
+    return [
+        "Accept": "*/*",
+        "Authorization": "Bearer ${currentAccessToken()}",
+        "User-Agent": "kumocloud/1122"
+    ]
+}
+
+def socketIoRequest(String method, Map query, String body, Integer timeoutSec) {
+    def status = 0
+    def text = ""
+    def params = [
+        uri: "${SOCKET_BASE}/socket.io/",
+        query: query,
+        headers: socketIoHeaders(),
+        contentType: "text/plain",
+        timeout: timeoutSec
+    ]
+    if (method == "POST") {
+        params.headers = socketIoHeaders() + ["Content-Type": "text/plain;charset=UTF-8"]
+        params.body = body ?: ""
+        params.requestContentType = "text/plain"
+        httpPost(params) { response ->
+            status = safeStatus(response)
+            text = socketIoResponseText(response)
+        }
+    } else {
+        httpGet(params) { response ->
+            status = safeStatus(response)
+            text = socketIoResponseText(response)
+        }
     }
+    return [status: status, text: text]
+}
+
+def socketIoResponseText(response) {
+    def data = response?.data
+    if (data instanceof Map || data instanceof List) {
+        return JsonOutput.toJson(data)
+    }
+    return data?.toString() ?: ""
+}
+
+def extractEngineIoOpenPacket(String text) {
+    if (!text) return null
+    def found = null
+    splitEngineIoMessages(text).each { raw ->
+        if (found) return
+        def msg = stripEngineIoLengthPrefix(raw)
+        if (msg?.startsWith("0") && msg.length() > 1) {
+            found = msg.substring(1)
+        }
+    }
+    return found
+}
+
+def engineIoHasConnectError(String text) {
+    return splitEngineIoMessages(text).any { stripEngineIoLengthPrefix(it)?.startsWith("44") }
+}
+
+def splitEngineIoMessages(String raw) {
+    if (!raw) return []
+    return raw.contains("\u001e") ? raw.split("\u001e") as List : [raw]
+}
+
+def stripEngineIoLengthPrefix(String msg) {
+    if (!msg) return msg
+    if (msg.contains(":") && msg.split(":")[0].isNumber()) {
+        return msg.split(":", 2)[1]
+    }
+    return msg
 }
 
 def socketIoPoll() {
@@ -2557,90 +2663,176 @@ def socketIoPoll() {
         return
     }
     try {
-        httpGet([
-            uri: "${SOCKET_BASE}/socket.io/",
-            query: [EIO: "4", transport: "polling", sid: state.socketIoSid],
-            headers: ["Accept": "*/*", "Authorization": "Bearer ${currentAccessToken()}"],
-            timeout: 25
-        ]) { response ->
-            def text = response?.data?.toString() ?: ""
-            socketIoHandleText(text)
-            if (state.socketIoActive) runIn(1, "socketIoPoll", [overwrite: false])
+        def q = [EIO: "4", transport: "polling", sid: state.socketIoSid]
+        def resp = socketIoRequest("GET", q, null, 25)
+        extractSocketIoPasswords(resp.text as String)
+        if (splitEngineIoMessages(resp.text as String).any { stripEngineIoLengthPrefix(it) == "2" }) {
+            socketIoRequest("POST", q, "3", 10)
         }
+        if (!state.socketIoActive) return
+        if (socketIoNeedRemaining().isEmpty()) {
+            finishSocketIo("complete")
+            return
+        }
+        runIn(1, "socketIoPoll", [overwrite: true])
     } catch (Exception e) {
         finishSocketIo("poll error: ${e.message}")
     }
 }
 
-def socketIoHandleText(String raw) {
+def extractSocketIoPasswords(String raw) {
     if (!raw) return
-    def messages = raw.contains("\u001e") ? raw.split("\u001e") : [raw]
-    messages.each { msg ->
-        if (!msg) return
-        if (msg.contains(":") && msg.split(":")[0].isNumber()) {
-            msg = msg.split(":", 2)[1]
-        }
-        if (msg == "2") {
-            socketIoPost("3")
-            return
-        }
-        if (msg.startsWith("42")) {
-            try {
-                def payload = new JsonSlurper().parseText(msg.substring(2))
-                if (payload instanceof List && payload.size() >= 2 && payload[0] == "adapter_update") {
-                    def info = payload[1]
-                    if (info instanceof Map) {
-                        def s = info.deviceSerial as String
-                        def pw = info.password as String
-                        if (s && pw) {
-                            ensureLocalCredEntry(s)
-                            state.localCreds[s].password = pw
-                            state.socketIoPasswords[s] = pw
-                            updateCredFetchFound()
-                        }
-                    }
-                }
-            } catch (ignored) {}
+    splitEngineIoMessages(raw).each { packet ->
+        def msg = stripEngineIoLengthPrefix(packet)
+        if (!msg?.startsWith("42")) return
+        try {
+            def payload = new JsonSlurper().parseText(msg.substring(2))
+            if (!(payload instanceof List) || payload.size() < 2) return
+            def eventName = payload[0]
+            def info = payload[1]
+            if (!(info instanceof Map)) return
+            if (eventName != "adapter_update" && !info.password) return
+            def s = info.deviceSerial as String
+            def pw = info.password as String
+            if (s && pw) {
+                ensureLocalCredEntry(s)
+                state.localCreds[s].password = pw
+                state.socketIoPasswords[s] = pw
+                updateCredFetchFound()
+                log.info "Received local device key for ${tailSerial(s)}"
+            }
+        } catch (Exception e) {
+            logDebug "Socket.IO packet parse skipped: ${e.message}"
         }
     }
-    if (state.socketIoStep == "connect") {
-        state.socketIoStep = "subscribed"
-        def userId = jwtUserId()
-        if (userId) socketIoPost("42[\"subscribe\",\"\",\"${userId}\"]")
-        (state.socketIoNeed ?: []).each { s ->
-            socketIoPost("42[\"subscribe\",\"${s}\"]")
-        }
-        (state.socketIoNeed ?: []).each { s ->
-            socketIoPost("42[\"force_adapter_request\",\"${s}\",\"adapterStatus\"]")
-        }
-        (state.socketIoNeed ?: []).each { s ->
-            socketIoPost("42[\"device_status_v2\",\"${s}\"]")
-        }
-    }
-    def need = state.socketIoNeed ?: []
-    def got = (state.socketIoPasswords ?: [:]).keySet()
-    if (need.every { it in got }) finishSocketIo("complete")
+}
+
+def socketIoNeedRemaining() {
+    def need = (state.socketIoNeed ?: []) as List
+    def got = (state.socketIoPasswords instanceof Map) ? state.socketIoPasswords.keySet() : []
+    return need.findAll { !(it in got) }
+}
+
+def captureKumoUserId(json) {
+    if (!(json instanceof Map)) return
+    def id = json.id ?: json.userId
+    if (id) state.kumoUserId = id.toString()
 }
 
 def jwtUserId() {
+    if (state.kumoUserId) return state.kumoUserId as String
     try {
         def token = currentAccessToken()
         if (!token) return null
         def parts = token.split("\\.")
         if (parts.size() < 2) return null
-        // JWT uses URL-safe base64 (-/_); convert before standard decode.
         def payloadB64 = (parts[1] as String).replace("-", "+").replace("_", "/")
         def pad = payloadB64.length() % 4
         if (pad > 0) payloadB64 += "=" * (4 - pad)
         def json = new JsonSlurper().parseText(new String(payloadB64.decodeBase64(), "UTF-8"))
-        return json?.id?.toString()
+        def id = json?.id ?: json?.sub ?: json?.userId
+        if (id) {
+            state.kumoUserId = id.toString()
+            return state.kumoUserId as String
+        }
     } catch (Exception e) {
+        logDebug "JWT user id decode failed: ${e.message}"
+    }
+    return null
+}
+
+def fetchKumoUserIdFromAccount() {
+    try {
+        def resp = null
+        httpGet([
+            uri: "${API_BASE}/${API_VERSION}/accounts/me",
+            headers: authHeaders(currentAccessToken()),
+            contentType: "application/json",
+            timeout: 15
+        ]) { response -> resp = response }
+        def json = parseMaybeJson(resp?.data)
+        captureKumoUserId(json)
+        return state.kumoUserId as String
+    } catch (Exception e) {
+        logDebug "accounts/me user id fetch failed: ${e.message}"
         return null
+    }
+}
+
+def tryLegacyPasswordFetch() {
+    if (!settings.username || !settings.password) return
+    log.info "Trying legacy Comfort Cloud login for local device keys"
+    try {
+        def loginResp = null
+        httpPost([
+            uri: "${LEGACY_API_BASE}/login",
+            headers: [
+                "Accept": "application/json, text/plain, */*",
+                "Content-Type": "application/json"
+            ],
+            body: JsonOutput.toJson([
+                username: settings.username,
+                password: settings.password,
+                appVersion: LEGACY_APP_VERSION
+            ]),
+            contentType: "application/json",
+            requestContentType: "application/json",
+            timeout: 20
+        ]) { response -> loginResp = response }
+        if (!loginResp || (loginResp.status as int) != 200) {
+            log.warn "Legacy credential fetch: HTTP ${loginResp?.status}"
+            return
+        }
+        def data = parseMaybeJson(loginResp.data)
+        def found = [:]
+        walkLegacyCreds(data, found)
+        def applied = 0
+        (state.socketIoNeed ?: []).each { serial ->
+            def s = serial as String
+            def cred = found[s]
+            if (!(cred instanceof Map) || !cred.password) return
+            ensureLocalCredEntry(s)
+            state.localCreds[s].password = cred.password
+            if (cred.cryptoSerial) state.localCreds[s].cryptoSerial = cred.cryptoSerial
+            state.socketIoPasswords[s] = cred.password
+            applied++
+        }
+        if (applied) {
+            updateCredFetchFound()
+            log.info "Legacy Comfort Cloud login provided ${applied} local device key(s)"
+        }
+    } catch (Exception e) {
+        log.warn "Legacy credential fetch failed: ${e.message}"
+    }
+}
+
+def walkLegacyCreds(node, Map found) {
+    if (node instanceof List) {
+        node.each { walkLegacyCreds(it, found) }
+        return
+    }
+    if (!(node instanceof Map)) return
+    node.each { key, value ->
+        if (value instanceof Map) {
+            if (value.password && value.cryptoSerial) {
+                found[key as String] = [password: value.password as String, cryptoSerial: value.cryptoSerial as String]
+            }
+            walkLegacyCreds(value, found)
+        } else if (value instanceof List) {
+            walkLegacyCreds(value, found)
+        }
     }
 }
 
 def finishSocketIo(String reason) {
     state.socketIoActive = false
+    state.remove("socketIoRetryOnce")
+    if (reason != "complete" && reason != "cancelled") {
+        tryLegacyPasswordFetch()
+        if (socketIoNeedRemaining().isEmpty() && state.socketIoNeed) {
+            reason = "complete"
+        }
+    }
     log.info "Socket.IO password fetch finished: ${reason}"
     finalizeCredFetch(reason)
     recomputeOfflineReady()
@@ -2804,10 +2996,10 @@ def finalizeCredFetch(String reason) {
     } else if (reason == "timeout") {
         fetch.status = "timeout"
         def missing = total - found
-        fetch.message = "${found} of ${total} device keys fetched. ${missing} zone(s) did not respond — try again, or check that the unit is on Wi-Fi."
+        fetch.message = "${found} of ${total} device keys fetched from Comfort Cloud. ${missing} still missing — tap Fetch local device keys to try again."
     } else {
         fetch.status = "error"
-        fetch.message = "Could not fetch device keys (${reason}). Confirm Login successful above and try again."
+        fetch.message = "Could not fetch device keys (${reason}). Tap Fetch local device keys to try again."
     }
     state.credFetch = fetch
 }
