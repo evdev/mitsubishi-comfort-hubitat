@@ -153,13 +153,14 @@ def mainPage() {
             ], defaultValue: "60", required: true
         }
         section("Local control") {
-            paragraph "Each zone needs two things for local control: a local device key (fetched automatically — you never type it) and a LAN IP (type it below, or scan). Cloud control works without either."
+            paragraph "Each zone needs two things for local LAN control: a local device key (fetched from Comfort Cloud — you never type it) and a LAN IP (type it below, or scan). Cloud control works without either."
+            paragraph localKeysCloudNotice()
             input name: "preferLocal", type: "bool", title: "Prefer local LAN control", defaultValue: true
             input name: "allowOffline", type: "bool", title: "Allow offline local control when internet is down", defaultValue: true
             if (state.offlineReady) {
                 paragraph "Offline ready: cached device keys and IPs allow local control without internet."
             } else if (state.knownSerials instanceof List && !state.knownSerials.isEmpty()) {
-                paragraph "Offline not ready: fetch local device keys, then enter or scan unit IPs below."
+                paragraph "Offline not ready: local device keys and/or unit IPs are missing. If Fetch reports keys are not published by Comfort Cloud, cloud control still works; local/offline cannot be enabled until Mitsubishi publishes those keys again."
             }
             if (state.cloudOffline) {
                 paragraph "Operating in offline local-only mode (cloud unreachable)."
@@ -168,7 +169,7 @@ def mainPage() {
                 paragraph "Last cloud contact: ${state.lastCloudContact}"
             }
 
-            paragraph "Step 1 — Local device keys. These come from your Comfort Cloud login automatically. There is no password to type here. Tap Fetch local device keys, then wait about 15–30 seconds."
+            paragraph "Step 1 — Local device keys. Tap Fetch to ask Comfort Cloud for them. There is no key to type. If Mitsubishi is not publishing keys (common since August 2026), cloud thermostats still work; only local LAN / offline control stays unavailable."
             def fetching = credFetchRunning()
             input name: "btnRefreshCreds", type: "button", title: "Fetch local device keys", disabled: fetching == true
             href name: "credFetchPageHref", page: "credFetchPage", title: fetching ? "Watch device key progress" : "Device key status",
@@ -260,8 +261,11 @@ def credFetchPage() {
     def fetch = credFetchMap()
     def running = fetch.status == "running"
     dynamicPage(name: "credFetchPage", title: "Local device keys", uninstall: false, install: false, refreshInterval: running ? 4 : 0) {
+        section("About local device keys") {
+            paragraph localKeysCloudNotice()
+        }
         section("Fetch") {
-            paragraph "Local device keys are retrieved automatically from Comfort Cloud using the email and password you already entered above. You never type a device key. This usually takes 15–30 seconds."
+            paragraph "Tap Fetch to ask Comfort Cloud again. You never type a key. If keys are already cached from an older setup, they are kept — Mitsubishi withheld them from the API; they did not rotate them on the adapters."
             if (fetch.message) paragraph fetch.message as String
             if (running) {
                 def found = (fetch.found ?: 0) as int
@@ -2473,6 +2477,11 @@ def sendLocalCommands(String serial, Map cloudCommands) {
 }
 
 // --- Socket.IO password fetch ---
+// Around August 1, 2026 Mitsubishi stopped including password and cryptoSerial in
+// Comfort Cloud V3 REST and Socket.IO adapter_update. The official Comfort app
+// no longer receives them either (pykumo issue 78). Cached adapter keys still
+// authenticate locally; new fetches often return nothing. Keep trying the legacy
+// login and a short socket session in case Mitsubishi restores the fields.
 
 def sioState() {
     def s = atomicState.sio
@@ -2573,7 +2582,7 @@ def startSocketIoPasswordFetch(Boolean forceAll = false, Boolean isRetry = false
         active: true,
         need: need,
         got: [:],
-        deadline: now() + 180000L,
+        deadline: now() + 25000L,
         step: "open",
         retryOnce: isRetry == true,
         nsWaitTries: 0,
@@ -2584,12 +2593,12 @@ def startSocketIoPasswordFetch(Boolean forceAll = false, Boolean isRetry = false
     ])
     persistCredFetch([
         status: "running",
-        message: "Fetching local device keys from Comfort Cloud…",
+        message: "Checking live adapter status for device keys…",
         total: need.size(),
         found: 0,
         startedAt: now()
     ])
-    runIn(30, "socketIoWatchdog", [overwrite: true])
+    runIn(12, "socketIoWatchdog", [overwrite: true])
     socketIoStartAsync()
 }
 
@@ -2781,7 +2790,7 @@ def socketIoAsyncCallback(response, data) {
         return
     }
     if (socketIoAllAdapterUpdatesLackPassword()) {
-        log.info "Socket.IO adapter_update has no local device key for every remaining zone"
+        log.info "Socket.IO adapter_update omitted the local device key; stopping fetch"
         finishSocketIo("v3-no-password")
         return
     }
@@ -2952,6 +2961,7 @@ def socketIoPostForceAndStatus() {
     def packets = []
     serials.each { s ->
         packets << socketIoEvent(["force_adapter_request", s.toString(), "adapterStatus"])
+        packets << socketIoEvent(["force_adapter_request", s.toString(), "adapterInfo"])
     }
     packets << socketIoEvent(["device_status_v2", ""])
     serials.each { s -> packets << socketIoEvent(["device_status_v2", s.toString()]) }
@@ -3006,7 +3016,7 @@ def socketIoWatchdog() {
         finishSocketIo("timeout")
         return
     }
-    runIn(30, "socketIoWatchdog", [overwrite: true])
+    runIn(12, "socketIoWatchdog", [overwrite: true])
 }
 
 def extractSocketIoSid(String text, parsed = null) {
@@ -3084,8 +3094,8 @@ def harvestPasswordNode(node) {
     if (node instanceof List) {
         if (node.size() >= 2) {
             def eventName = node[0]
-            if (eventName instanceof String && eventName != "adapter_update") {
-                logDebug "Socket.IO event ${eventName}"
+            if (eventName instanceof String && eventName != "adapter_update" && eventName != "device_update" && eventName != "subscribed") {
+                log.info "Socket.IO event ${eventName}"
             }
             def info = node[1]
             def extra = (node.size() > 2) ? node[2] : null
@@ -3131,13 +3141,11 @@ def socketIoMarkAdapterSeen(String serial) {
 }
 
 def socketIoAllAdapterUpdatesLackPassword() {
-    def remaining = socketIoNeedRemaining()
-    if (!remaining) return false
-    def seen = sioState().adapterSeen
-    if (!(seen instanceof List) || seen.isEmpty()) return false
-    return remaining.every { serial ->
-        seen.find { it?.toString()?.equalsIgnoreCase(serial as String) }
-    }
+    def sio = sioState()
+    def got = sio.got
+    if (got instanceof Map && !got.isEmpty()) return false
+    def seen = sio.adapterSeen
+    return (seen instanceof List) && !seen.isEmpty()
 }
 
 def firstPasswordField(info) {
@@ -3265,24 +3273,30 @@ def tryLegacyPasswordFetch(serials = null) {
     def targets = (serials ?: sioState().need ?: state.socketIoNeed ?: state.knownSerials ?: []) as List
     def found = [:]
     def attempts = [
-        [path: "/login", appKey: false, rawJson: false],
         [path: "/login", appKey: false, rawJson: true],
-        [path: "/login", appKey: true, rawJson: true],
-        [path: "/v2/login", appKey: false, rawJson: true]
+        [path: "/login", appKey: false, rawJson: false]
     ]
+    def parsedLogin = false
     attempts.each { spec ->
-        if (!found.isEmpty()) return
+        if (!found.isEmpty() || parsedLogin) return
         def data = legacyLoginJson(spec)
         if (data == null) return
+        parsedLogin = true
         log.info "Legacy login ${spec.path} appKey=${spec.appKey} rawJson=${spec.rawJson} ${legacyDescribe(data)}"
         logLegacyOutline(data)
         def stats = [maps: 0, lists: 0, zoneTables: 0, serials: 0, passwords: 0]
         walkLegacyCreds(data, found, stats)
         log.info "Legacy walk stats maps=${stats.maps} lists=${stats.lists} zoneTables=${stats.zoneTables} serials=${stats.serials} passwords=${stats.passwords}"
+        if (legacyZoneTablesEmpty(data)) {
+            state.legacyZoneTableEmpty = true
+            log.info "Legacy V2 zoneTable is empty (Comfort-only site); no local device keys in this login"
+        } else {
+            state.legacyZoneTableEmpty = false
+        }
     }
     log.info "Legacy login walked ${found.size()} credential entr${found.size() == 1 ? 'y' : 'ies'}"
     if (found.isEmpty()) {
-        log.warn "Legacy login JSON had no device keys after ${attempts.size()} attempt(s)"
+        log.warn "Legacy login JSON had no device keys"
     }
     def applied = 0
     targets.each { serial ->
@@ -3305,6 +3319,33 @@ def tryLegacyPasswordFetch(serials = null) {
     } else if (found) {
         log.warn "Legacy login returned ${found.size()} key(s) but none matched known zone serials (${found.keySet().collect { tailSerial(it as String) }})"
     }
+}
+
+def legacyZoneTablesEmpty(data) {
+    if (!jsonIsList(data) || data.size() < 3) return false
+    def tree = data[2]
+    if (!jsonIsMap(tree)) return false
+    def zt = jsonGet(tree, "zoneTable")
+    if (jsonIsMap(zt) && zt.size() > 0) return false
+    def ch = jsonGet(tree, "children")
+    if (!jsonIsList(ch)) return true
+    def n = 0
+    try { n = ch.size() } catch (ignored) { return true }
+    for (int i = 0; i < n; i++) {
+        def child = ch[i]
+        def childZt = jsonIsMap(child) ? jsonGet(child, "zoneTable") : null
+        if (jsonIsMap(childZt) && childZt.size() > 0) return false
+        def grand = jsonIsMap(child) ? jsonGet(child, "children") : null
+        if (jsonIsList(grand)) {
+            def gn = 0
+            try { gn = grand.size() } catch (ignored) { gn = 0 }
+            for (int j = 0; j < gn; j++) {
+                def gzt = jsonIsMap(grand[j]) ? jsonGet(grand[j], "zoneTable") : null
+                if (jsonIsMap(gzt) && gzt.size() > 0) return false
+            }
+        }
+    }
+    return true
 }
 
 def legacyDescribe(data) {
@@ -3553,10 +3594,10 @@ def harvestLegacyDevice(raw, String keyHint, Map found, Map stats) {
 }
 
 def looksLikeDeviceSerial(String value) {
-    if (!value || value.length() < 8) return false
+    if (!value || value.length() < 10) return false
     def lower = value.toLowerCase()
     if (lower.contains("password") || lower.contains("token") || lower.contains("child") || lower.contains("zone") || lower.contains("user") || lower.contains("email")) return false
-    return true
+    return value.matches(".*[0-9].*")
 }
 
 def finishSocketIo(String reason) {
@@ -3567,7 +3608,7 @@ def finishSocketIo(String reason) {
     sio.active = false
     sioStateSet(sio)
     commitFetchedDeviceKeys()
-    if (reason != "complete" && reason != "cancelled") {
+    if (reason != "complete" && reason != "cancelled" && state.legacyZoneTableEmpty != true) {
         tryLegacyPasswordFetch()
         if (socketIoNeedRemaining().isEmpty() && (sio.need ?: state.socketIoNeed)) {
             reason = "complete"
@@ -3575,6 +3616,9 @@ def finishSocketIo(String reason) {
     }
     commitFetchedDeviceKeys()
     runIn(1, "commitFetchedDeviceKeys", [overwrite: true])
+    if (reason == "v3-no-password") {
+        state.v3AdapterOmitsPassword = true
+    }
     log.info "Socket.IO password fetch finished: ${reason}"
     finalizeCredFetch(reason)
     recomputeOfflineReady()
@@ -3676,9 +3720,20 @@ def unitHasDeviceKey(String serial) {
     return got instanceof Map && got[serial]
 }
 
+def localKeysCloudNotice() {
+    return "Mitsubishi stopped publishing local device keys in Comfort Cloud around August 1, 2026. The official Comfort app, Home Assistant (pykumo / hass-kumo), and this Hubitat app all see the same thing: live adapter status no longer includes password or cryptoSerial, and Comfort-only sites have an empty legacy unit list. Cloud control still works. Local LAN, IP scan, and offline control need those keys. If you already have cached keys from before the change, keep them — they still work on the adapters. Fetching again cannot invent keys Mitsubishi omitted. This is tracked as pykumo issue 78."
+}
+
+def localKeysUnavailableMessage() {
+    return "Comfort Cloud is not publishing local device keys (Mitsubishi withheld them from the API around August 2026). Cloud control still works. Local LAN / offline control cannot be enabled until those keys are published again. Cached keys from before the change still work if you have them."
+}
+
 def unitDeviceKeyStatusLine(String serial) {
     if (unitHasDeviceKey(serial)) return "Device key: Cached"
     if (credFetchRunning()) return "Device key: Fetching…"
+    if (state.v3AdapterOmitsPassword == true || state.legacyZoneTableEmpty == true) {
+        return "Device key: Not published by Comfort Cloud (cloud control still works)"
+    }
     return "Device key: Not yet available — tap Fetch local device keys above"
 }
 
@@ -3753,9 +3808,9 @@ def finalizeCredFetch(String reason) {
     if (reason == "complete" || (total > 0 && found == total)) {
         fetch.status = "complete"
         fetch.message = "${found} of ${total} device keys fetched."
-    } else if (reason == "v3-no-password") {
-        fetch.status = "timeout"
-        fetch.message = "Comfort Cloud did not include local device keys in live adapter status. ${found} of ${total} fetched from the legacy login. If this stays at 0, tap Fetch again and send logs that include Legacy login list[."
+    } else if (reason == "v3-no-password" || (found == 0 && (state.legacyZoneTableEmpty == true || state.v3AdapterOmitsPassword == true))) {
+        fetch.status = "unavailable"
+        fetch.message = localKeysUnavailableMessage()
     } else if (reason == "timeout") {
         fetch.status = "timeout"
         def missing = total - found
@@ -3794,6 +3849,8 @@ def renderCredFetchUnitStatus() {
             paragraph "${name} — cached"
         } else if (credFetchRunning()) {
             paragraph "${name} — fetching…"
+        } else if (state.v3AdapterOmitsPassword == true || state.legacyZoneTableEmpty == true) {
+            paragraph "${name} — not published by Comfort Cloud"
         } else {
             paragraph "${name} — not yet available"
         }
