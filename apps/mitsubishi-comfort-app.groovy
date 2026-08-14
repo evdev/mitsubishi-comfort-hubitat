@@ -633,6 +633,8 @@ def onAuthSuccess() {
 def maybeStartCredentialFetch() {
     if (state.cloudOffline) return
     if (!tokenIsFresh()) return
+    def cooldown = atomicState.sioCooldownUntil
+    if (cooldown && now() < (cooldown as long)) return
     startSocketIoPasswordFetch()
 }
 
@@ -900,6 +902,7 @@ def dailyCredentialRefresh() {
 }
 
 def pollDevices() {
+    if (sioState().active == true) return
     if (state.cloudOffline) {
         refreshAllDeviceDetailsLocal()
         (state.knownSerials ?: []).each { serial ->
@@ -913,11 +916,13 @@ def pollDevices() {
 }
 
 def pollZones() {
+    if (sioState().active == true) return
     if (state.cloudOffline && state.offlineReady) return
     discoverZones()
 }
 
 def pollStatusAll() {
+    if (sioState().active == true) return
     if (state.cloudOffline) {
         (state.knownSerials ?: []).each { serial ->
             def s = serial as String
@@ -935,6 +940,7 @@ def pollStatusAll() {
 }
 
 def pollNotificationsAll() {
+    if (sioState().active == true) return
     if (state.cloudOffline && state.offlineReady) return
     (state.zoneIndex ?: [:]).each { serial, info ->
         if (info?.zoneId) {
@@ -946,6 +952,7 @@ def pollNotificationsAll() {
 }
 
 def pollProfilesAll() {
+    if (sioState().active == true) return
     if (state.cloudOffline) {
         (state.knownSerials ?: []).each { serial ->
             def s = serial as String
@@ -2471,6 +2478,7 @@ def sioStateSet(Map sio) {
 }
 
 def startSocketIoPasswordFetch(Boolean forceAll = false, Boolean isRetry = false) {
+    if (forceAll) atomicState.sioCooldownUntil = null
     def existing = sioState()
     if (existing.active == true) {
         def deadline = (existing.deadline ?: 0L) as long
@@ -2517,14 +2525,26 @@ def startSocketIoPasswordFetch(Boolean forceAll = false, Boolean isRetry = false
         }
         return
     }
+    def userId = jwtUserId()
+    if (!userId) userId = fetchKumoUserIdFromAccount()
+    if (userId) {
+        state.kumoUserId = userId
+        atomicState.kumoUserId = userId
+    } else {
+        log.warn "Comfort Cloud user id not found before socket fetch — adapter keys may not arrive"
+    }
+    log.info "Socket.IO fetch starting ${need.size()} zone(s) accountSubscribe=${userId ? 'yes' : 'NO'}"
     sioStateSet([
         active: true,
         need: need,
         got: [:],
-        deadline: now() + 120000L,
+        deadline: now() + 180000L,
         step: "open",
         retryOnce: isRetry == true,
-        nsWaitTries: 0
+        nsWaitTries: 0,
+        userId: userId,
+        lastForceAt: 0L,
+        busy: false
     ])
     persistCredFetch([
         status: "running",
@@ -2553,7 +2573,19 @@ def socketIoHeaders() {
 def socketIoSend(String method, String body, String step) {
     def sio = sioState()
     if (sio.active != true) return
+    if (sio.busy == true) {
+        log.info "Socket.IO defer ${method} ${step}; in-flight ${sio.step}"
+        sio.deferMethod = method
+        sio.deferBody = (body ?: "").toString()
+        sio.deferStep = step
+        sioStateSet(sio)
+        return
+    }
+    sio.busy = true
     sio.step = step
+    sio.remove("deferMethod")
+    sio.remove("deferBody")
+    sio.remove("deferStep")
     sioStateSet(sio)
     def query = [EIO: "4", transport: "polling", t: now().toString()]
     if (step != "open" && sio.sid) query.sid = sio.sid.toString()
@@ -2576,8 +2608,25 @@ def socketIoSend(String method, String body, String step) {
         if (method == "POST") asynchttpPost("socketIoAsyncCallback", params, data)
         else asynchttpGet("socketIoAsyncCallback", params, data)
     } catch (Exception e) {
+        sio = sioState()
+        sio.busy = false
+        sioStateSet(sio)
         finishSocketIo("send error: ${e.message}")
     }
+}
+
+def socketIoFlushDeferred() {
+    def sio = sioState()
+    if (sio.active != true || sio.busy == true) return
+    def step = sio.deferStep as String
+    if (!step) return
+    def method = (sio.deferMethod ?: "GET") as String
+    def body = (sio.deferBody ?: "").toString()
+    sio.remove("deferMethod")
+    sio.remove("deferBody")
+    sio.remove("deferStep")
+    sioStateSet(sio)
+    socketIoSend(method, body, step)
 }
 
 def socketIoAsyncParsed(response) {
@@ -2656,6 +2705,13 @@ def socketIoAsyncCallback(response, data) {
     def sio = sioState()
     if (sio.active != true) return
     def step = (data?.step ?: sio.step) as String
+    def callbackSid = data?.sid?.toString()
+    if (step != "open" && callbackSid && sio.sid && callbackSid != sio.sid.toString()) {
+        log.info "Socket.IO ignore stale ${step}"
+        return
+    }
+    sio.busy = false
+    sioStateSet(sio)
     def method = (data?.method ?: "?") as String
     def status = safeStatus(response)
     def parsed = socketIoAsyncParsed(response)
@@ -2665,6 +2721,7 @@ def socketIoAsyncCallback(response, data) {
 
     if (status == 401) {
         socketIoRetryAuth("unauthorized")
+        socketIoFlushDeferred()
         return
     }
 
@@ -2676,6 +2733,7 @@ def socketIoAsyncCallback(response, data) {
     if (status == 400) {
         log.warn "Socket.IO session error at ${step}: ${socketIoLogSnippet(text)}"
         socketIoRetryAuth("session HTTP 400")
+        socketIoFlushDeferred()
         return
     }
 
@@ -2691,21 +2749,25 @@ def socketIoAsyncCallback(response, data) {
             return
         }
         log.info "Socket.IO ${step} timed out; continuing"
-        if (step == "poll" || step == "pong") {
+        if (step == "poll" || step == "pong" || step == "reforcePost") {
             runIn(1, "socketIoPoll", [overwrite: true])
+            socketIoFlushDeferred()
             return
         }
         if (step?.endsWith("Post")) {
             socketIoHandleStep(step, "", null)
+            socketIoFlushDeferred()
             return
         }
         socketIoSend("GET", null, step)
+        socketIoFlushDeferred()
         return
     }
 
     if (step != "open" && extractEngineIoOpenPacket(text)) {
         log.warn "Socket.IO server started a new handshake during ${step}"
         socketIoRetryAuth("session reset")
+        socketIoFlushDeferred()
         return
     }
 
@@ -2717,6 +2779,7 @@ def socketIoAsyncCallback(response, data) {
         sio.resumeText = text
         sioStateSet(sio)
         socketIoSend("POST", "3", "pong")
+        socketIoFlushDeferred()
         return
     }
 
@@ -2730,6 +2793,7 @@ def socketIoAsyncCallback(response, data) {
     }
 
     socketIoHandleStep(step, text, parsed)
+    socketIoFlushDeferred()
 }
 
 def socketIoRetryAuth(String reason) {
@@ -2775,9 +2839,11 @@ def socketIoHandleStep(String step, String text, parsed) {
             socketIoSend("GET", null, "nsWait")
             return
         }
-        def userId = jwtUserId() ?: fetchKumoUserIdFromAccount()
+        def userId = sio.userId ?: jwtUserId()
         if (userId) {
-            log.info "Socket.IO account-level subscribe idLen=${userId.toString().length()}"
+            sio.userId = userId.toString()
+            sioStateSet(sio)
+            log.info "Socket.IO account-level subscribe"
             socketIoSend("POST", socketIoEvent(["subscribe", "", userId.toString()]), "acctPost")
         } else {
             log.warn "No Comfort Cloud user id — device keys may not arrive"
@@ -2786,7 +2852,7 @@ def socketIoHandleStep(String step, String text, parsed) {
         return
     }
     if (step == "acctPost") {
-        socketIoSend("GET", null, "acctWait")
+        socketIoPostDeviceSubscribes()
         return
     }
     if (step == "acctWait") {
@@ -2794,31 +2860,29 @@ def socketIoHandleStep(String step, String text, parsed) {
         return
     }
     if (step == "devPost") {
-        socketIoSend("GET", null, "devWait")
+        socketIoPostForceAndStatus()
         return
     }
     if (step == "devWait") {
         socketIoPostForceAndStatus()
         return
     }
-    if (step == "forcePost") {
-        def serials = (sio.need ?: []) as List
-        def statuses = [socketIoEvent(["device_status_v2", ""])]
-        serials.each { s -> statuses << socketIoEvent(["device_status_v2", s.toString()]) }
-        socketIoSend("POST", statuses.join("\u001e").toString(), "statusPost")
+    if (step == "forcePost" || step == "statusPost" || step == "reforcePost") {
+        updateCredFetchMessage("Waiting for device keys from Comfort Cloud…")
+        socketIoSend("GET", null, "poll")
         return
     }
-    if (step == "statusPost" || step == "pong" || step == "poll") {
+    if (step == "pong" || step == "poll") {
         if (now() > ((sio.deadline ?: 0L) as long)) {
             finishSocketIo("timeout")
             return
         }
-        if (step == "statusPost") {
-            updateCredFetchMessage("Waiting for device keys from Comfort Cloud…")
-            socketIoSend("GET", null, "poll")
+        def lastForce = (sio.lastForceAt ?: 0L) as long
+        if (socketIoNeedRemaining() && (now() - lastForce) > 20000L) {
+            socketIoReforceRemaining()
             return
         }
-        runIn(1, "socketIoPoll", [overwrite: true])
+        socketIoSend("GET", null, "poll")
         return
     }
     log.warn "Socket.IO unknown step ${step}"
@@ -2836,9 +2900,38 @@ def socketIoPostDeviceSubscribes() {
 }
 
 def socketIoPostForceAndStatus() {
-    def serials = (sioState().need ?: []) as List
-    def forces = serials.collect { s -> socketIoEvent(["force_adapter_request", s.toString(), "adapterStatus"]) }.join("\u001e")
-    socketIoSend("POST", forces.toString(), "forcePost")
+    def sio = sioState()
+    def serials = (sio.need ?: []) as List
+    def packets = []
+    serials.each { s ->
+        packets << socketIoEvent(["force_adapter_request", s.toString(), "adapterStatus"])
+    }
+    packets << socketIoEvent(["device_status_v2", ""])
+    serials.each { s -> packets << socketIoEvent(["device_status_v2", s.toString()]) }
+    sio.lastForceAt = now()
+    sioStateSet(sio)
+    log.info "Socket.IO force adapterStatus for ${serials.size()} zone(s)"
+    socketIoSend("POST", packets.join("\u001e").toString(), "forcePost")
+}
+
+def socketIoReforceRemaining() {
+    def remaining = socketIoNeedRemaining()
+    if (!remaining) {
+        socketIoSend("GET", null, "poll")
+        return
+    }
+    def sio = sioState()
+    def packets = []
+    if (sio.userId) packets << socketIoEvent(["subscribe", "", sio.userId.toString()])
+    remaining.each { s ->
+        packets << socketIoEvent(["subscribe", s.toString()])
+        packets << socketIoEvent(["force_adapter_request", s.toString(), "adapterStatus"])
+    }
+    sio.lastForceAt = now()
+    sioStateSet(sio)
+    log.info "Socket.IO re-force adapterStatus for ${remaining.size()} zone(s)"
+    updateCredFetchMessage("Still waiting — asking Comfort Cloud again for ${remaining.size()} device key(s)…")
+    socketIoSend("POST", packets.join("\u001e").toString(), "reforcePost")
 }
 
 def socketIoPoll() {
@@ -3021,11 +3114,15 @@ def updateCredFetchMessage(String message) {
 def captureKumoUserId(json) {
     if (!(json instanceof Map)) return
     def id = json.id ?: json.userId
-    if (id) state.kumoUserId = id.toString()
+    if (id) {
+        state.kumoUserId = id.toString()
+        atomicState.kumoUserId = id.toString()
+    }
 }
 
 def jwtUserId() {
     if (state.kumoUserId) return state.kumoUserId as String
+    if (atomicState.kumoUserId) return atomicState.kumoUserId as String
     try {
         def token = currentAccessToken()
         if (!token) return null
@@ -3038,6 +3135,7 @@ def jwtUserId() {
         def id = json?.id ?: json?.sub ?: json?.userId
         if (id) {
             state.kumoUserId = id.toString()
+            atomicState.kumoUserId = id.toString()
             return state.kumoUserId as String
         }
     } catch (Exception e) {
@@ -3169,7 +3267,12 @@ def finishSocketIo(String reason) {
     log.info "Socket.IO password fetch finished: ${reason}"
     finalizeCredFetch(reason)
     recomputeOfflineReady()
-    if (settings.enableSubnetScan) startIpDiscovery()
+    if (reason == "timeout" || reason?.startsWith("handshake") || reason == "unauthorized") {
+        atomicState.sioCooldownUntil = now() + 120000L
+    }
+    if (settings.enableSubnetScan && socketIoNeedRemaining().isEmpty()) {
+        startIpDiscovery()
+    }
 }
 
 // --- IP discovery ---
