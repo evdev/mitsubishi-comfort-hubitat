@@ -326,6 +326,7 @@ def initializeApp(Boolean fullInit) {
     state.pollingScheduled = false
     state.socketIoActive = false
     atomicState.sio = null
+    atomicState.credFetchBusy = false
     ensureStateMaps()
     try {
         ensureAllZoneChildren()
@@ -630,9 +631,14 @@ def onAuthSuccess() {
     }
 }
 
+def credFetchBusy() {
+    return atomicState.credFetchBusy == true || sioState().active == true
+}
+
 def maybeStartCredentialFetch() {
     if (state.cloudOffline) return
     if (!tokenIsFresh()) return
+    if (credFetchBusy()) return
     def cooldown = atomicState.sioCooldownUntil
     if (cooldown && now() < (cooldown as long)) return
     startSocketIoPasswordFetch()
@@ -902,7 +908,7 @@ def dailyCredentialRefresh() {
 }
 
 def pollDevices() {
-    if (sioState().active == true) return
+    if (credFetchBusy()) return
     if (state.cloudOffline) {
         refreshAllDeviceDetailsLocal()
         (state.knownSerials ?: []).each { serial ->
@@ -916,13 +922,13 @@ def pollDevices() {
 }
 
 def pollZones() {
-    if (sioState().active == true) return
+    if (credFetchBusy()) return
     if (state.cloudOffline && state.offlineReady) return
     discoverZones()
 }
 
 def pollStatusAll() {
-    if (sioState().active == true) return
+    if (credFetchBusy()) return
     if (state.cloudOffline) {
         (state.knownSerials ?: []).each { serial ->
             def s = serial as String
@@ -940,7 +946,7 @@ def pollStatusAll() {
 }
 
 def pollNotificationsAll() {
-    if (sioState().active == true) return
+    if (credFetchBusy()) return
     if (state.cloudOffline && state.offlineReady) return
     (state.zoneIndex ?: [:]).each { serial, info ->
         if (info?.zoneId) {
@@ -952,7 +958,7 @@ def pollNotificationsAll() {
 }
 
 def pollProfilesAll() {
-    if (sioState().active == true) return
+    if (credFetchBusy()) return
     if (state.cloudOffline) {
         (state.knownSerials ?: []).each { serial ->
             def s = serial as String
@@ -1081,7 +1087,13 @@ def handleZonesResponse(int status, parsed) {
         runIn(3, "maybeStartCredentialFetch", [overwrite: true])
     }
     if (settings.enableSubnetScan) {
-        runIn(5, "startIpDiscovery", [overwrite: true])
+        def missingKeys = (activeSerials as List).findAll { s ->
+            def creds = state.localCreds[s as String]
+            !(creds instanceof Map && creds.password)
+        }
+        if (missingKeys.isEmpty()) {
+            runIn(5, "startIpDiscovery", [overwrite: true])
+        }
     }
 }
 
@@ -2533,6 +2545,7 @@ def startSocketIoPasswordFetch(Boolean forceAll = false, Boolean isRetry = false
     } else {
         log.warn "Comfort Cloud user id not found before socket fetch — adapter keys may not arrive"
     }
+    atomicState.credFetchBusy = true
     persistCredFetch([
         status: "running",
         message: "Fetching local device keys from Comfort Cloud…",
@@ -2544,6 +2557,7 @@ def startSocketIoPasswordFetch(Boolean forceAll = false, Boolean isRetry = false
     tryLegacyPasswordFetch(need)
     need = need.findAll { s -> !state.localCreds[s]?.password }
     if (need.isEmpty()) {
+        atomicState.credFetchBusy = false
         persistCredFetch([
             status: "complete",
             message: "${(state.knownSerials ?: []).size()} of ${(state.knownSerials ?: []).size()} device keys fetched.",
@@ -2565,7 +2579,8 @@ def startSocketIoPasswordFetch(Boolean forceAll = false, Boolean isRetry = false
         nsWaitTries: 0,
         userId: userId,
         lastForceAt: 0L,
-        busy: false
+        busy: false,
+        adapterSeen: []
     ])
     persistCredFetch([
         status: "running",
@@ -2760,8 +2775,14 @@ def socketIoAsyncCallback(response, data) {
     }
 
     extractSocketIoPasswords(text, parsed)
+    if (sioState().active != true) return
     if (socketIoNeedRemaining().isEmpty()) {
         finishSocketIo("complete")
+        return
+    }
+    if (socketIoAllAdapterUpdatesLackPassword()) {
+        log.info "Socket.IO adapter_update has no local device key for every remaining zone"
+        finishSocketIo("v3-no-password")
         return
     }
 
@@ -2901,6 +2922,10 @@ def socketIoHandleStep(String step, String text, parsed) {
         }
         def lastForce = (sio.lastForceAt ?: 0L) as long
         if (socketIoNeedRemaining() && (now() - lastForce) > 20000L) {
+            if (socketIoAllAdapterUpdatesLackPassword()) {
+                finishSocketIo("v3-no-password")
+                return
+            }
             socketIoReforceRemaining()
             return
         }
@@ -3078,35 +3103,67 @@ def harvestPasswordNode(node) {
 
 def harvestPasswordMap(Map info, String eventName) {
     def pw = firstPasswordField(info)
-    def s = (info.deviceSerial ?: info.serial) as String
+    def s = (jsonGet(info, "deviceSerial") ?: jsonGet(info, "serial")) as String
     if (eventName == "adapter_update") {
-        def keys = info.keySet().collect { it?.toString() }.join(",")
+        def keys = jsonKeys(info).collect { it?.toString() }.join(",")
         log.info "Socket.IO adapter_update serial=${s ? tailSerial(s) : 'none'} hasKey=${pw ? 'yes' : 'no'} keys=${keys}"
+        if (s && !pw) socketIoMarkAdapterSeen(s)
     }
     if (s && pw) {
         socketIoSavePassword(s, pw)
         return
     }
-    info.each { k, v ->
-        if (v instanceof Map || v instanceof List) harvestPasswordNode(v)
+    jsonKeys(info).each { k ->
+        def v = jsonGet(info, k)
+        if (jsonIsMap(v) || jsonIsList(v)) harvestPasswordNode(v)
     }
 }
 
-def firstPasswordField(Map info) {
-    if (!info) return null
+def socketIoMarkAdapterSeen(String serial) {
+    if (!serial) return
+    def sio = sioState()
+    def seen = (sio.adapterSeen instanceof List) ? (sio.adapterSeen as List) : []
+    if (!seen.find { it?.toString()?.equalsIgnoreCase(serial) }) {
+        seen << serial
+        sio.adapterSeen = seen
+        sioStateSet(sio)
+    }
+}
+
+def socketIoAllAdapterUpdatesLackPassword() {
+    def remaining = socketIoNeedRemaining()
+    if (!remaining) return false
+    def seen = sioState().adapterSeen
+    if (!(seen instanceof List) || seen.isEmpty()) return false
+    return remaining.every { serial ->
+        seen.find { it?.toString()?.equalsIgnoreCase(serial as String) }
+    }
+}
+
+def firstPasswordField(info) {
+    if (!info || !jsonIsMap(info)) return null
     def found = null
     ["password", "localPassword", "unitPassword", "adapterPassword", "devicePassword"].each { name ->
         if (found) return
-        def v = info[name]
-        if ((v instanceof String) && v) found = v
+        found = coerceSecret(jsonGet(info, name))
     }
     if (found) return found
-    info.each { k, v ->
+    jsonKeys(info).each { k ->
         if (found) return
         def name = k?.toString()?.toLowerCase()
-        if (name?.contains("pass") && !name.contains("ssid") && (v instanceof String) && v) found = v
+        if (name?.contains("pass") && !name.contains("ssid") && !name.contains("network")) {
+            found = coerceSecret(jsonGet(info, k))
+        }
     }
     return found
+}
+
+def coerceSecret(v) {
+    if (v == null) return null
+    if (jsonIsMap(v) || jsonIsList(v)) return null
+    def s = v.toString()?.trim()
+    if (!s || s == "null" || s == "JSONNull" || s == "[:]" || s == "[]") return null
+    return s
 }
 
 def socketIoSavePassword(String serial, String password) {
@@ -3206,22 +3263,26 @@ def tryLegacyPasswordFetch(serials = null) {
     if (!settings.username || !settings.password) return
     log.info "Trying legacy Comfort Cloud login for local device keys"
     def targets = (serials ?: sioState().need ?: state.socketIoNeed ?: state.knownSerials ?: []) as List
-    def data = legacyLoginJson(false)
     def found = [:]
-    if (data != null) {
-        log.info "Legacy login response ${legacyDescribe(data)}"
-        walkLegacyCreds(data, found)
-    }
-    if (found.isEmpty()) {
-        data = legacyLoginJson(true)
-        if (data != null) {
-            log.info "Legacy login (app key) response ${legacyDescribe(data)}"
-            walkLegacyCreds(data, found)
-        }
+    def attempts = [
+        [path: "/login", appKey: false, rawJson: false],
+        [path: "/login", appKey: false, rawJson: true],
+        [path: "/login", appKey: true, rawJson: true],
+        [path: "/v2/login", appKey: false, rawJson: true]
+    ]
+    attempts.each { spec ->
+        if (!found.isEmpty()) return
+        def data = legacyLoginJson(spec)
+        if (data == null) return
+        log.info "Legacy login ${spec.path} appKey=${spec.appKey} rawJson=${spec.rawJson} ${legacyDescribe(data)}"
+        logLegacyOutline(data)
+        def stats = [maps: 0, lists: 0, zoneTables: 0, serials: 0, passwords: 0]
+        walkLegacyCreds(data, found, stats)
+        log.info "Legacy walk stats maps=${stats.maps} lists=${stats.lists} zoneTables=${stats.zoneTables} serials=${stats.serials} passwords=${stats.passwords}"
     }
     log.info "Legacy login walked ${found.size()} credential entr${found.size() == 1 ? 'y' : 'ies'}"
-    if (found.isEmpty() && data != null) {
-        log.warn "Legacy login JSON had no device keys (${legacyDescribe(data)})"
+    if (found.isEmpty()) {
+        log.warn "Legacy login JSON had no device keys after ${attempts.size()} attempt(s)"
     }
     def applied = 0
     targets.each { serial ->
@@ -3247,86 +3308,261 @@ def tryLegacyPasswordFetch(serials = null) {
 }
 
 def legacyDescribe(data) {
-    if (data instanceof List) return "list size=${data.size()}"
-    if (data instanceof Map) return "map keys=${data.keySet()}"
+    if (jsonIsList(data)) return "list size=${data.size()}"
+    if (jsonIsMap(data)) return "map keys=${jsonKeys(data).join(',')}"
     if (data == null) return "null"
     return "text len=${data.toString().length()}"
 }
 
-def legacyLoginJson(Boolean withAppKey) {
+def logLegacyOutline(data) {
+    if (jsonIsList(data)) {
+        def n = 0
+        try { n = data.size() } catch (ignored) { n = 0 }
+        for (int i = 0; i < n; i++) {
+            log.info "Legacy login list[${i}] ${legacyOutline(data[i], 0)}"
+        }
+        return
+    }
+    log.info "Legacy login body ${legacyOutline(data, 0)}"
+}
+
+def legacyOutline(node, int depth) {
+    if (depth > 5) return "..."
+    if (node == null) return "null"
+    if (jsonIsList(node)) {
+        def n = 0
+        try { n = node.size() } catch (ignored) { return "List(?)" }
+        if (n == 0) return "List(0)"
+        def max = Math.min(n, 4)
+        def parts = []
+        for (int i = 0; i < max; i++) {
+            parts << legacyOutline(node[i], depth + 1)
+        }
+        def more = n > max ? ", +${n - max} more" : ""
+        return "List(${n})[${parts.join(' | ')}${more}]"
+    }
+    if (jsonIsMap(node)) {
+        def keys = jsonKeys(node).collect { it?.toString() }.sort()
+        def bits = []
+        bits << "keys=${keys.join(',')}"
+        def zt = jsonGet(node, "zoneTable")
+        if (jsonIsMap(zt)) bits << "zoneTable=${zt.size()}"
+        def ch = jsonGet(node, "children")
+        if (jsonIsList(ch)) bits << "children=${ch.size()}"
+        def serial = jsonGet(node, "serial") ?: jsonGet(node, "deviceSerial")
+        if (serial) bits << "serial=${tailSerial(serial.toString())}"
+        bits << (firstPasswordField(node) ? "pw=yes" : "pw=no")
+        def extra = ""
+        if (depth < 3 && jsonIsList(ch) && ch.size() > 0) {
+            extra = " child0=${legacyOutline(ch[0], depth + 1)}"
+        } else if (depth < 3 && jsonIsMap(zt) && zt.size() > 0) {
+            def zk = jsonKeys(zt)
+            if (zk) extra = " unit0=${legacyOutline(jsonGet(zt, zk[0]), depth + 1)}"
+        }
+        return "Map(${bits.join(' ')}${extra})"
+    }
+    if (node instanceof Number) return "num"
+    if (node instanceof Boolean) return "bool"
+    def s = node.toString()
+    if (s.startsWith("{") || s.startsWith("[")) return "strJSON(${s.length()})"
+    return "str(${s.length()})"
+}
+
+def legacyLoginJson(Map spec) {
+    def path = (spec.path ?: "/login") as String
+    def withAppKey = spec.appKey == true
+    def rawJson = spec.rawJson == true
     try {
         def headers = [
             "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "en-US,en",
-            "Content-Type": "application/json"
+            "Accept-Language": "en-US,en"
         ]
         if (withAppKey) headers["Application-Key"] = LEGACY_APP_KEY
-        def loginResp = null
-        httpPost([
-            uri: "${LEGACY_API_BASE}/login",
+        def payload = [
+            username: settings.username,
+            password: settings.password,
+            appVersion: LEGACY_APP_VERSION
+        ]
+        def params = [
+            uri: "${LEGACY_API_BASE}${path}",
             headers: headers,
-            body: JsonOutput.toJson([
-                username: settings.username,
-                password: settings.password,
-                appVersion: LEGACY_APP_VERSION
-            ]),
-            contentType: "text/plain",
-            requestContentType: "application/json",
-            timeout: 20
-        ]) { response -> loginResp = response }
+            timeout: 20,
+            contentType: "text/plain"
+        ]
+        if (rawJson) {
+            headers["Content-Type"] = "application/json"
+            params.headers = headers
+            params.body = JsonOutput.toJson(payload)
+            params.requestContentType = "text/plain"
+        } else {
+            params.body = payload
+            params.requestContentType = "application/json"
+        }
+        def loginResp = null
+        httpPost(params) { response -> loginResp = response }
         def status = loginResp ? (loginResp.status as int) : 0
         if (status != 200) {
-            log.warn "Legacy credential fetch${withAppKey ? ' (app key)' : ''}: HTTP ${status}"
+            log.warn "Legacy credential fetch ${path} appKey=${withAppKey} rawJson=${rawJson}: HTTP ${status}"
             return null
         }
-        def raw = loginResp.data
-        if (!(raw instanceof Map) && !(raw instanceof List) && raw != null) {
-            return parseMaybeJson(raw.toString())
-        }
-        return parseMaybeJson(raw)
+        return parseLegacyLoginBody(loginResp)
     } catch (Exception e) {
-        log.warn "Legacy credential fetch${withAppKey ? ' (app key)' : ''} failed: ${e.message}"
+        log.warn "Legacy credential fetch ${path} appKey=${withAppKey} rawJson=${rawJson} failed: ${e.message}"
         return null
     }
 }
 
-def walkLegacyCreds(node, Map found) {
-    if (node instanceof List) {
-        node.each { walkLegacyCreds(it, found) }
-        return
+def parseLegacyLoginBody(loginResp) {
+    def raw = null
+    try {
+        if (loginResp?.respondsTo("getData")) raw = loginResp.getData()
+    } catch (ignored) {}
+    if (raw == null) raw = loginResp?.data
+    def data = null
+    if (raw instanceof String || raw instanceof GString) {
+        data = parseMaybeJson(raw.toString())
+    } else {
+        data = parseMaybeJson(raw)
     }
-    if (!(node instanceof Map)) return
-    harvestLegacyDevice(node, null, found)
-    def zoneTable = node.zoneTable
-    if (zoneTable instanceof Map) {
-        zoneTable.each { key, value ->
-            if (value instanceof Map) harvestLegacyDevice(value, key as String, found)
+    return repairLegacyLoginNode(data)
+}
+
+def repairLegacyLoginNode(node) {
+    if (node instanceof String || node instanceof GString) {
+        def text = node.toString().trim()
+        if (text.startsWith("{") || text.startsWith("[")) {
+            try { return repairLegacyLoginNode(new JsonSlurper().parseText(text)) }
+            catch (ignored) {}
+        }
+        return node
+    }
+    if (jsonIsList(node)) {
+        def repaired = []
+        def n = 0
+        try { n = node.size() } catch (ignored) { return node }
+        for (int i = 0; i < n; i++) {
+            repaired << repairLegacyLoginNode(node[i])
+        }
+        return repaired
+    }
+    return node
+}
+
+def jsonIsMap(node) {
+    return node instanceof Map
+}
+
+def jsonIsList(node) {
+    return node instanceof List
+}
+
+def isJsonNull(v) {
+    if (v == null) return true
+    def s = v.toString()
+    return s == "null" || s == "JSONNull"
+}
+
+def jsonKeys(node) {
+    def keys = []
+    if (node == null || !jsonIsMap(node)) return keys
+    try {
+        node.keySet().each { k -> keys << k }
+        return keys
+    } catch (Exception ignored) {}
+    try {
+        node.each { entry ->
+            if (entry instanceof Map.Entry) keys << entry.key
+        }
+    } catch (Exception ignored) {}
+    return keys
+}
+
+def jsonGet(node, key) {
+    if (node == null || key == null) return null
+    def v = null
+    try { v = node[key] } catch (ignored) {}
+    if (isJsonNull(v)) {
+        v = null
+        try { v = node.get(key) } catch (ignored) {}
+    }
+    if (isJsonNull(v) && jsonIsMap(node)) {
+        def want = key.toString()
+        jsonKeys(node).each { k ->
+            if (!isJsonNull(v)) return
+            if (k?.toString()?.equalsIgnoreCase(want)) {
+                try { v = node[k] } catch (ignored) {}
+            }
         }
     }
-    node.each { key, value ->
-        if (key?.toString() == "zoneTable") return
-        if (value instanceof Map) {
-            harvestLegacyDevice(value, key as String, found)
-            walkLegacyCreds(value, found)
-        } else if (value instanceof List) {
-            walkLegacyCreds(value, found)
+    return isJsonNull(v) ? null : v
+}
+
+def walkLegacyCreds(node, Map found, Map stats) {
+    if (jsonIsList(node)) {
+        stats.lists = ((stats.lists ?: 0) as int) + 1
+        def n = 0
+        try { n = node.size() } catch (ignored) { return }
+        for (int i = 0; i < n; i++) {
+            walkLegacyCreds(node[i], found, stats)
+        }
+        return
+    }
+    if (!jsonIsMap(node)) return
+    stats.maps = ((stats.maps ?: 0) as int) + 1
+    harvestLegacyDevice(node, null, found, stats)
+    def zoneTable = jsonGet(node, "zoneTable")
+    if (jsonIsMap(zoneTable)) {
+        stats.zoneTables = ((stats.zoneTables ?: 0) as int) + 1
+        jsonKeys(zoneTable).each { k ->
+            def value = jsonGet(zoneTable, k)
+            if (jsonIsMap(value)) harvestLegacyDevice(value, k?.toString(), found, stats)
+        }
+    }
+    jsonKeys(node).each { k ->
+        if (k?.toString()?.equalsIgnoreCase("zoneTable")) return
+        def value = jsonGet(node, k)
+        if (jsonIsMap(value)) {
+            harvestLegacyDevice(value, k?.toString(), found, stats)
+            walkLegacyCreds(value, found, stats)
+        } else if (jsonIsList(value)) {
+            walkLegacyCreds(value, found, stats)
         }
     }
 }
 
-def harvestLegacyDevice(Map raw, String keyHint, Map found) {
-    def serial = (raw.serial ?: raw.deviceSerial ?: keyHint) as String
+def harvestLegacyDevice(raw, String keyHint, Map found, Map stats) {
+    if (!jsonIsMap(raw)) return
+    def hint = keyHint?.toLowerCase()
+    if (hint == "network" || hint == "wifi" || hint == "ssid") return
+    def serial = (jsonGet(raw, "serial") ?: jsonGet(raw, "deviceSerial")) as String
+    if (!serial && keyHint && looksLikeDeviceSerial(keyHint)) serial = keyHint
     def pw = firstPasswordField(raw)
+    if (serial) {
+        stats.serials = ((stats.serials ?: 0) as int) + 1
+        if (((stats.serials ?: 0) as int) <= 8) {
+            log.info "Legacy unit serial=${tailSerial(serial)} keys=${jsonKeys(raw).join(',')} pw=${pw ? 'yes' : 'no'}"
+        }
+    }
     if (!serial || !pw) return
+    stats.passwords = ((stats.passwords ?: 0) as int) + 1
+    def crypto = jsonGet(raw, "cryptoSerial") ?: jsonGet(raw, "crypto_serial")
     found[serial] = [
         password: pw as String,
-        cryptoSerial: (raw.cryptoSerial ?: "") as String
+        cryptoSerial: (crypto ?: "") as String
     ]
+}
+
+def looksLikeDeviceSerial(String value) {
+    if (!value || value.length() < 8) return false
+    def lower = value.toLowerCase()
+    if (lower.contains("password") || lower.contains("token") || lower.contains("child") || lower.contains("zone") || lower.contains("user") || lower.contains("email")) return false
+    return true
 }
 
 def finishSocketIo(String reason) {
     unschedule("socketIoWatchdog")
     unschedule("socketIoPoll")
+    atomicState.credFetchBusy = false
     def sio = sioState()
     sio.active = false
     sioStateSet(sio)
@@ -3342,7 +3578,7 @@ def finishSocketIo(String reason) {
     log.info "Socket.IO password fetch finished: ${reason}"
     finalizeCredFetch(reason)
     recomputeOfflineReady()
-    if (reason == "timeout" || reason?.startsWith("handshake") || reason == "unauthorized") {
+    if (reason == "timeout" || reason == "v3-no-password" || reason?.startsWith("handshake") || reason == "unauthorized") {
         atomicState.sioCooldownUntil = now() + 120000L
     }
     if (settings.enableSubnetScan && socketIoNeedRemaining().isEmpty()) {
@@ -3517,6 +3753,9 @@ def finalizeCredFetch(String reason) {
     if (reason == "complete" || (total > 0 && found == total)) {
         fetch.status = "complete"
         fetch.message = "${found} of ${total} device keys fetched."
+    } else if (reason == "v3-no-password") {
+        fetch.status = "timeout"
+        fetch.message = "Comfort Cloud did not include local device keys in live adapter status. ${found} of ${total} fetched from the legacy login. If this stays at 0, tap Fetch again and send logs that include Legacy login list[."
     } else if (reason == "timeout") {
         fetch.status = "timeout"
         def missing = total - found
@@ -3532,6 +3771,7 @@ def cancelCredFetch() {
     def sio = sioState()
     sio.active = false
     sioStateSet(sio)
+    atomicState.credFetchBusy = false
     unschedule("socketIoWatchdog")
     unschedule("socketIoPoll")
     def fetch = credFetchMap()
